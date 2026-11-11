@@ -496,18 +496,20 @@ impl InputManager {
         )));
     }
 
-    /// What drives the mouse: the first dock mouse (its latest report, for
-    /// its buttons; its movement went in through `update_gamepad`), else
-    /// the first dock gamepad that is neither a light gun nor a mouse (its
-    /// right stick, R1, L1 and R3; nothing without one); and the handheld's
-    /// own L and R. The pad's buttons also reach the core as the pad's, as
-    /// they always do.
+    /// What drives the mouse: the dock mice as one (their latest reports,
+    /// for their buttons together; their movement went in through
+    /// `update_gamepad`), else the first dock gamepad that is neither a
+    /// light gun nor a mouse (its right stick, R1, L1 and R3; nothing
+    /// without one); and the handheld's own L and R. The pad's buttons also
+    /// reach the core as the pad's, as they always do.
     fn mouse_input(&self) -> MouseInput {
         let states = || self.gamepads.iter().map(|gamepad| &gamepad.state);
-        let mouse = states().find(|state| state.is_mouse());
+        let mice = states()
+            .filter(|state| state.is_mouse())
+            .map(|state| state.mouse_report());
         let pad = states().find(|state| !state.is_light_gun() && !state.is_mouse());
         MouseInput {
-            mouse: mouse.map(|mouse| mouse.mouse_report()),
+            mouse: MouseReport::merged(mice),
             stick_x: pad.map_or(0, |pad| pad.axis_rx),
             stick_y: pad.map_or(0, |pad| pad.axis_ry),
             pad_r1: pad.is_some_and(|pad| pad.btn_r1),

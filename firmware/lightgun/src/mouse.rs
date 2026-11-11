@@ -21,7 +21,9 @@
 //!    `SENSITIVITY_DENOMINATOR` (1/2: the core doubles, so one count of the
 //!    mouse is one count of the 3DO mouse), the fraction of a unit carried
 //!    to the next packet. While a mouse is on the dock the stick does
-//!    nothing; when it goes the stick goes on, from where it is then.
+//!    nothing; when it goes the stick goes on, from where it is then. Two
+//!    mice at once are one: their movements add up, a button is held while
+//!    either holds it (`MouseReport::merged`).
 //!
 //!  * The first dock gamepad's right stick as a velocity cursor (`Cursor`):
 //!    the stick's deflection past `DEAD_ZONE` is a speed, linear up to
@@ -103,6 +105,21 @@ impl MouseReport {
 
     pub const fn middle(&self) -> bool {
         self.pressed(button::MIDDLE)
+    }
+
+    /// The mice on the dock as one, from their latest reports: a button is
+    /// held while any mouse holds it; no movement (each report's counts
+    /// once, through `Mouse::report`). None without a mouse, so a mouse is
+    /// connected while any is.
+    pub fn merged(reports: impl IntoIterator<Item = MouseReport>) -> Option<MouseReport> {
+        reports.into_iter().fold(None, |merged, report| {
+            Some(MouseReport {
+                dx: 0,
+                dy: 0,
+                wheel: 0,
+                buttons: merged.map_or(0, |merged: MouseReport| merged.buttons) | report.buttons,
+            })
+        })
     }
 }
 
@@ -322,7 +339,8 @@ impl Cursor {
 /// own buttons either way.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct MouseInput {
-    /// The physical mouse's latest report (None: no mouse on the dock). Only
+    /// The physical mice on the dock as one, their latest reports' buttons
+    /// together (`MouseReport::merged`; None: no mouse on the dock). Only
     /// its buttons are read here: a report's movement counts once, through
     /// `Mouse::report`, since the latest report is the same one until the
     /// next arrives. While it is Some the stick and the pad's buttons below
@@ -1087,6 +1105,109 @@ mod tests {
         m.report(&moved(100, 100));
         assert!(!m.motion.pending());
         assert!(m.update(44, false, &physical(0)).is_empty());
+    }
+
+    #[test]
+    fn two_mice_are_one() {
+        assert_eq!(MouseReport::merged([]), None, "no mouse");
+        // One mouse: its buttons, and no movement (counted per report).
+        assert_eq!(
+            MouseReport::merged([MouseReport {
+                dx: 5,
+                dy: -5,
+                wheel: 1,
+                ..dock_mouse(button::LEFT)
+            }]),
+            Some(dock_mouse(button::LEFT))
+        );
+        // Two: a button held on either is held, whichever comes first.
+        let buttons = |reports: &[MouseReport]| {
+            let merged = MouseReport::merged(reports.iter().copied());
+            assert!(merged.is_some(), "a mouse is connected while any is");
+            MouseInput {
+                mouse: merged,
+                ..MouseInput::default()
+            }
+            .buttons()
+        };
+        assert_eq!(buttons(&[dock_mouse(0), dock_mouse(0)]), 0);
+        assert_eq!(buttons(&[dock_mouse(button::LEFT), dock_mouse(0)]), 0b001);
+        assert_eq!(buttons(&[dock_mouse(0), dock_mouse(button::LEFT)]), 0b001);
+        assert_eq!(buttons(&[moved(3, 3), dock_mouse(button::RIGHT)]), 0b010);
+        assert_eq!(
+            buttons(&[dock_mouse(button::LEFT), dock_mouse(button::MIDDLE)]),
+            0b101
+        );
+        assert_eq!(
+            buttons(&[dock_mouse(button::MIDDLE), dock_mouse(button::LEFT)]),
+            0b101
+        );
+        assert_eq!(
+            buttons(&[
+                dock_mouse(button::LEFT),
+                dock_mouse(button::LEFT),
+                dock_mouse(button::RIGHT)
+            ]),
+            0b011
+        );
+        assert_eq!(
+            buttons(&[
+                dock_mouse(button::BACK),
+                dock_mouse(button::FORWARD),
+                moved(1, 1)
+            ]),
+            0,
+            "nothing the 3DO mouse has"
+        );
+
+        // In the stream: both mice's movement adds up, either's buttons
+        // count, and one left is still a mouse (the stick does nothing).
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        let both = |a: MouseReport, b: MouseReport| MouseInput {
+            mouse: MouseReport::merged([a, b]),
+            stick_x: FULL,
+            pad_r1: true,
+            ..MouseInput::default()
+        };
+        assert_eq!(
+            writes(&m.update(0, false, &both(dock_mouse(0), dock_mouse(0)))),
+            [(0x1034, 0)]
+        );
+        m.report(&moved(2, 0));
+        m.report(&moved(0, 2));
+        assert_eq!(
+            writes(&m.update(8, false, &both(moved(2, 0), moved(0, 2)))),
+            [(0x1030, pack_motion(1, 1))]
+        );
+        // The second mouse presses left.
+        assert_eq!(
+            writes(&m.update(9, false, &both(moved(2, 0), dock_mouse(button::LEFT)))),
+            [(0x1034, 0b001)]
+        );
+        // The first presses right while the second holds left.
+        assert_eq!(
+            writes(&m.update(
+                10,
+                false,
+                &both(dock_mouse(button::RIGHT), dock_mouse(button::LEFT))
+            )),
+            [(0x1034, 0b011)]
+        );
+        // The second releases: the first's right stays.
+        assert_eq!(
+            writes(&m.update(11, false, &both(dock_mouse(button::RIGHT), dock_mouse(0)))),
+            [(0x1034, 0b010)]
+        );
+        // The second is unplugged: still a mouse, its right still held,
+        // and the stick (full right all along) still does nothing.
+        let one = MouseInput {
+            mouse: MouseReport::merged([dock_mouse(button::RIGHT)]),
+            ..both(dock_mouse(0), dock_mouse(0))
+        };
+        assert!(m.update(20, false, &one).is_empty());
+        assert!(m.update(28, false, &one).is_empty());
+        assert!(m.update(100, false, &one).is_empty());
     }
 
     #[test]
