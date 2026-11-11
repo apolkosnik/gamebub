@@ -1,4 +1,4 @@
-//! A 3DO mouse from a gamepad's right stick.
+//! A 3DO mouse from a mouse on the dock, or from a gamepad's right stick.
 //!
 //! The 3DO core takes a mouse on its control port beside the pad while its
 //! Controller register (`crate::Target::enable`, 0x1014) holds
@@ -8,31 +8,157 @@
 //! setting's value to `Mouse::set_target`, and the mouse works only while it
 //! is `CONTROLLER_MOUSE`.
 //!
-//! The mouse is a velocity cursor on the first dock gamepad's right stick
-//! (`Cursor`): the stick's deflection past `DEAD_ZONE` is a speed, linear up
-//! to `MAX_SPEED` units per second at full deflection, integrated over time.
-//! What is below one unit stays accumulated, so a slow deflection still
-//! moves. The core gets, over the host memory interface (`Target`):
+//! What drives it is one of two things, in this order:
+//!
+//!  * A physical mouse on the dock. The dock reports one as an ordinary
+//!    gamepad (`GamepadData`) with bit 30 of its buttons set
+//!    (`button::MOUSE`; a light gun has bit 31): the left stick is the
+//!    movement since the previous report (lx right, ly down, in the mouse's
+//!    counts), the left Z axis the wheel, bits 0-4 its buttons
+//!    (`MouseReport`). Every report is one movement, counted exactly once
+//!    (`Mouse::report`), summed across the reports since the previous
+//!    packet (`Motion`) and scaled by `SENSITIVITY_NUMERATOR` /
+//!    `SENSITIVITY_DENOMINATOR` (1/2: the core doubles, so one count of the
+//!    mouse is one count of the 3DO mouse), the fraction of a unit carried
+//!    to the next packet. While a mouse is on the dock the stick does
+//!    nothing; when it goes the stick goes on, from where it is then.
+//!
+//!  * The first dock gamepad's right stick as a velocity cursor (`Cursor`):
+//!    the stick's deflection past `DEAD_ZONE` is a speed, linear up to
+//!    `MAX_SPEED` units per second at full deflection, integrated over time.
+//!    What is below one unit stays accumulated, so a slow deflection still
+//!    moves.
+//!
+//! The core gets, over the host memory interface (`Target`):
 //!
 //!  * `Target::motion`: `{dy[31:16], dx[15:0]}`, two signed 16-bit units
 //!    moved since the previous write (x right, y down), see `pack_motion`.
 //!    Each write is one movement packet (the core moves the 3DO mouse 2
 //!    counts per unit and clamps a packet to +-255 per axis), so packets are
 //!    small and frequent: written only when there is movement, at most
-//!    every `MIN_MOTION_INTERVAL_MS`;
+//!    every `MIN_MOTION_INTERVAL_MS`, clamped to `MAX_PACKET` per axis (a
+//!    physical mouse's excess waits for the next packet; the stick's is
+//!    dropped);
 //!  * `Target::buttons`: bit 0 left, bit 1 right, bit 2 middle (held = 1),
-//!    see `pack_buttons`, written on a change. The pad's R1 is left, L1
-//!    right, R3 (the right stick's click) middle; the handheld's own L and
-//!    R are left and right too, so the mouse clicks without a dock pad
-//!    (`MouseInput::buttons`).
+//!    see `pack_buttons`, written on a change. A physical mouse's left,
+//!    right and middle buttons are those (its others do nothing); without
+//!    one the pad's R1 is left, L1 right, R3 (the right stick's click)
+//!    middle. The handheld's own L and R are left and right either way, so
+//!    the mouse clicks without a dock pad (`MouseInput::buttons`).
 //!
 //! A light gun on the dock wins: while one is connected the gun code holds
 //! the Controller register at 1 (`crate::Controller`) and the mouse stands
 //! still with its buttons released (`Mouse::update`'s `gun_connected`).
 //! When the gun is unplugged the gun code writes the setting's value back,
 //! and the mouse goes on.
+//!
+//! A physical mouse is never a gamepad: the firmware keeps it out of the
+//! merged pad (its movement is not a stick, its buttons are not the pad's).
 
 use crate::Writes;
+
+/// The dock's mouse buttons (bits of `GamepadData`'s buttons word).
+pub mod button {
+    /// Set on every report of a mouse.
+    pub const MOUSE: u32 = 1 << 30;
+    pub const LEFT: u32 = 1 << 0;
+    pub const RIGHT: u32 = 1 << 1;
+    pub const MIDDLE: u32 = 1 << 2;
+    /// Not the 3DO mouse's.
+    pub const BACK: u32 = 1 << 3;
+    pub const FORWARD: u32 = 1 << 4;
+}
+
+/// One report of a physical mouse from the dock, as received.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MouseReport {
+    /// Movement since the previous report, in the mouse's counts: x
+    /// positive right (the dock's lx), y positive down (ly).
+    pub dx: i16,
+    pub dy: i16,
+    /// The wheel's movement (the dock's lz, two's complement); not the 3DO
+    /// mouse's.
+    pub wheel: i16,
+    /// The dock's buttons word, `button::*`.
+    pub buttons: u32,
+}
+
+impl MouseReport {
+    /// Whether a dock gamepad's buttons word is a mouse's.
+    pub const fn is_mouse(buttons: u32) -> bool {
+        (buttons & button::MOUSE) != 0
+    }
+
+    pub const fn pressed(&self, mask: u32) -> bool {
+        (self.buttons & mask) == mask
+    }
+
+    pub const fn left(&self) -> bool {
+        self.pressed(button::LEFT)
+    }
+
+    pub const fn right(&self) -> bool {
+        self.pressed(button::RIGHT)
+    }
+
+    pub const fn middle(&self) -> bool {
+        self.pressed(button::MIDDLE)
+    }
+}
+
+/// A physical mouse's sensitivity: the units written to the core per count
+/// of the mouse, as the fraction `SENSITIVITY_NUMERATOR` /
+/// `SENSITIVITY_DENOMINATOR`. 1/2: the core moves the 3DO mouse 2 counts
+/// per unit, so one count of the mouse moves the 3DO mouse one count. The
+/// fraction of a unit left over after a packet is carried to the next, so
+/// nothing is lost: a mouse moved one count at a time still moves.
+pub const SENSITIVITY_NUMERATOR: i64 = 1;
+pub const SENSITIVITY_DENOMINATOR: i64 = 2;
+
+/// A physical mouse's movement: the reports since the previous packet
+/// summed, in `SENSITIVITY_DENOMINATOR`ths of a unit, with what a packet
+/// did not take (the fraction of a unit, and anything beyond `MAX_PACKET`)
+/// kept for the next.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Motion {
+    x: i64,
+    y: i64,
+}
+
+impl Motion {
+    pub const fn new() -> Self {
+        Motion { x: 0, y: 0 }
+    }
+
+    /// Forget what was not taken (the mouse stopped being the core's).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// One report's movement, in the mouse's counts.
+    pub fn add(&mut self, dx: i16, dy: i16) {
+        self.x += dx as i64 * SENSITIVITY_NUMERATOR;
+        self.y += dy as i64 * SENSITIVITY_NUMERATOR;
+    }
+
+    /// The whole units moved since the last take, at most `MAX_PACKET` per
+    /// axis (toward zero), taken out: the fraction below one unit and the
+    /// excess beyond the clamp stay for the next take.
+    pub fn take(&mut self) -> (i16, i16) {
+        fn take_axis(accumulated: &mut i64) -> i16 {
+            let units = (*accumulated / SENSITIVITY_DENOMINATOR)
+                .clamp(-(MAX_PACKET as i64), MAX_PACKET as i64);
+            *accumulated -= units * SENSITIVITY_DENOMINATOR;
+            units as i16
+        }
+        (take_axis(&mut self.x), take_axis(&mut self.y))
+    }
+
+    /// Whether there is movement not yet taken (a whole unit or a fraction).
+    pub fn pending(&self) -> bool {
+        self.x != 0 || self.y != 0
+    }
+}
 
 /// The Controller register's / setting's values.
 pub const CONTROLLER_PAD: u32 = 0;
@@ -98,9 +224,11 @@ pub const MIN_MOTION_INTERVAL_MS: u64 = 8;
 /// updates (the firmware was busy) moves the mouse this much, not by a jump.
 pub const MAX_STEP_MS: u64 = 100;
 
-/// The most movement in one packet per axis (the core's clamp). Beyond it
-/// movement is dropped; at `MAX_SPEED` with `MAX_STEP_MS` that takes more
-/// than eight updates without a packet, which the controller does not do.
+/// The most movement in one packet per axis (the core's clamp). A physical
+/// mouse's movement beyond it waits for the next packet (`Motion`); the
+/// stick's is dropped (`Cursor`): at `MAX_SPEED` with `MAX_STEP_MS` that
+/// takes more than eight updates without a packet, which the controller
+/// does not do.
 pub const MAX_PACKET: i32 = 255;
 
 /// The stick's deflection past the dead zone: 0 inside it, then linear to
@@ -189,10 +317,17 @@ impl Cursor {
     }
 }
 
-/// What drives the mouse: the first dock gamepad (a light gun is not one)
-/// and the handheld's own buttons.
+/// What drives the mouse: a physical mouse on the dock if there is one,
+/// else the first dock gamepad (a light gun is not one); and the handheld's
+/// own buttons either way.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct MouseInput {
+    /// The physical mouse's latest report (None: no mouse on the dock). Only
+    /// its buttons are read here: a report's movement counts once, through
+    /// `Mouse::report`, since the latest report is the same one until the
+    /// next arrives. While it is Some the stick and the pad's buttons below
+    /// do nothing.
+    pub mouse: Option<MouseReport>,
     /// The pad's right stick (the dock's rx, ry: 0 centre, positive right /
     /// down); 0 without a pad.
     pub stick_x: i16,
@@ -207,20 +342,34 @@ pub struct MouseInput {
 }
 
 impl MouseInput {
-    /// The left button: the pad's R1 (under the index finger of the hand
-    /// on the stick), or the handheld's L.
+    /// The left button: the physical mouse's, or without one the pad's R1
+    /// (under the index finger of the hand on the stick); or the handheld's
+    /// L.
     pub const fn left(&self) -> bool {
-        self.pad_r1 || self.handheld_l
+        let dock = match self.mouse {
+            Some(mouse) => mouse.left(),
+            None => self.pad_r1,
+        };
+        dock || self.handheld_l
     }
 
-    /// The right button: the pad's L1, or the handheld's R.
+    /// The right button: the physical mouse's, or without one the pad's L1;
+    /// or the handheld's R.
     pub const fn right(&self) -> bool {
-        self.pad_l1 || self.handheld_r
+        let dock = match self.mouse {
+            Some(mouse) => mouse.right(),
+            None => self.pad_l1,
+        };
+        dock || self.handheld_r
     }
 
-    /// The middle button: the right stick's click.
+    /// The middle button: the physical mouse's, or without one the right
+    /// stick's click.
     pub const fn middle(&self) -> bool {
-        self.pad_r3
+        match self.mouse {
+            Some(mouse) => mouse.middle(),
+            None => self.pad_r3,
+        }
     }
 
     /// The buttons register, `pack_buttons`.
@@ -235,6 +384,9 @@ pub struct Mouse {
     target: Option<Target>,
     /// The core's Controller setting (`CONTROLLER_*`).
     controller: u32,
+    /// A physical mouse's movement since the previous packet.
+    motion: Motion,
+    /// The stick's.
     cursor: Cursor,
     sent_buttons: Option<u32>,
     last_motion_write: Option<u64>,
@@ -251,6 +403,7 @@ impl Mouse {
         Mouse {
             target: None,
             controller: CONTROLLER_PAD,
+            motion: Motion::new(),
             cursor: Cursor::new(),
             sent_buttons: None,
             last_motion_write: None,
@@ -283,13 +436,26 @@ impl Mouse {
         self.controller
     }
 
+    /// A report of the physical mouse, as it arrives (each one once): its
+    /// movement is added to the next packet's, while the core takes the
+    /// mouse and the setting selects it (else it is dropped: nothing is
+    /// saved up for later). The buttons are the next `update`'s, through
+    /// `MouseInput::mouse`.
+    pub fn report(&mut self, report: &MouseReport) {
+        if self.enabled() {
+            self.motion.add(report.dx, report.dy);
+        }
+    }
+
     /// The inputs at `now_ms`: the writes for the core. `gun_connected`: a
     /// light gun is on the dock, and the core's (the gun code holds the
     /// Controller register at 1); the mouse then stands still, its buttons
     /// released, as it does while the setting is not `CONTROLLER_MOUSE`.
     ///
-    /// A movement packet is written when there are whole units to move, at
-    /// most every `MIN_MOTION_INTERVAL_MS`; a button change at once.
+    /// A movement packet is written when there are whole units to move
+    /// (the physical mouse's reports since the previous packet, or the
+    /// stick's integral), at most every `MIN_MOTION_INTERVAL_MS`; a button
+    /// change at once.
     pub fn update(&mut self, now_ms: u64, gun_connected: bool, input: &MouseInput) -> Writes {
         let mut writes = Writes::default();
         let Some(target) = self.target else {
@@ -297,6 +463,7 @@ impl Mouse {
         };
 
         if !self.enabled() || gun_connected {
+            self.motion.reset();
             self.cursor.reset();
             self.last_motion_write = None;
             if self.sent_buttons.is_some_and(|buttons| buttons != 0) {
@@ -306,12 +473,25 @@ impl Mouse {
             return writes;
         }
 
-        self.cursor.update(now_ms, input.stick_x, input.stick_y);
+        // A physical mouse on the dock drives it; the stick waits, and
+        // starts over (no catch-up) when the mouse goes. Without one the
+        // stick drives it, and the mouse's leftovers go.
+        let physical = input.mouse.is_some();
+        if physical {
+            self.cursor.reset();
+        } else {
+            self.motion.reset();
+            self.cursor.update(now_ms, input.stick_x, input.stick_y);
+        }
         let due = self
             .last_motion_write
             .is_none_or(|at| now_ms.saturating_sub(at) >= MIN_MOTION_INTERVAL_MS);
         if due {
-            let (dx, dy) = self.cursor.take();
+            let (dx, dy) = if physical {
+                self.motion.take()
+            } else {
+                self.cursor.take()
+            };
             if (dx, dy) != (0, 0) {
                 writes.push(target.motion, pack_motion(dx, dy));
                 self.last_motion_write = Some(now_ms);
@@ -343,6 +523,33 @@ mod tests {
 
     fn writes(w: &Writes) -> Vec<(u32, u32)> {
         w.as_slice().to_vec()
+    }
+
+    /// A dock mouse's report with these buttons and no movement.
+    fn dock_mouse(buttons: u32) -> MouseReport {
+        MouseReport {
+            dx: 0,
+            dy: 0,
+            wheel: 0,
+            buttons: button::MOUSE | buttons,
+        }
+    }
+
+    /// A dock mouse's report of this movement, no buttons.
+    fn moved(dx: i16, dy: i16) -> MouseReport {
+        MouseReport {
+            dx,
+            dy,
+            ..dock_mouse(0)
+        }
+    }
+
+    /// A dock mouse with these buttons, nothing else.
+    fn physical(buttons: u32) -> MouseInput {
+        MouseInput {
+            mouse: Some(dock_mouse(buttons)),
+            ..MouseInput::default()
+        }
     }
 
     #[test]
@@ -438,6 +645,448 @@ mod tests {
         assert_eq!(both_left.buttons(), 0b001);
         // The stick does not press anything.
         assert_eq!(stick(FULL, i16::MIN).buttons(), 0);
+
+        // With a mouse on the dock: its buttons one to one, and the
+        // handheld's; the pad's are the pad's.
+        let pad_held = MouseInput {
+            mouse: Some(dock_mouse(0)),
+            pad_r1: true,
+            pad_l1: true,
+            pad_r3: true,
+            ..none
+        };
+        assert_eq!(
+            pad_held.buttons(),
+            0,
+            "the pad's buttons while a mouse is there"
+        );
+        for (bits, expected) in [
+            (button::LEFT, 0b001),
+            (button::RIGHT, 0b010),
+            (button::MIDDLE, 0b100),
+            (button::LEFT | button::MIDDLE, 0b101),
+            (button::LEFT | button::RIGHT | button::MIDDLE, 0b111),
+            (button::BACK | button::FORWARD, 0),
+            (0x3FFF_FFF8, 0),
+        ] {
+            let input = MouseInput {
+                mouse: Some(dock_mouse(bits)),
+                ..pad_held
+            };
+            assert_eq!(input.buttons(), expected, "{bits:#x}");
+        }
+        let l = MouseInput {
+            handheld_l: true,
+            ..physical(0)
+        };
+        assert_eq!(l.buttons(), 0b001, "the handheld's L with a mouse");
+        let r = MouseInput {
+            handheld_r: true,
+            ..physical(button::LEFT)
+        };
+        assert_eq!(r.buttons(), 0b011, "the handheld's R with a mouse");
+        // A report's movement does not press anything.
+        let moving = MouseInput {
+            mouse: Some(moved(i16::MIN, i16::MAX)),
+            ..none
+        };
+        assert_eq!(moving.buttons(), 0);
+    }
+
+    #[test]
+    fn mouse_marker_is_bit_30() {
+        assert!(MouseReport::is_mouse(0x4000_0000));
+        assert!(MouseReport::is_mouse(0xC000_0007));
+        assert!(
+            !MouseReport::is_mouse(0x8000_0000),
+            "a light gun is not a mouse"
+        );
+        assert!(!MouseReport::is_mouse(0xBFFF_FFFF));
+        assert!(!MouseReport::is_mouse(0));
+        assert!(
+            !crate::GunReport::is_light_gun(0x4000_0000),
+            "a mouse is not a light gun"
+        );
+    }
+
+    #[test]
+    fn dock_mouse_button_bits() {
+        let r = dock_mouse(1 << 0);
+        assert!(r.left() && !r.right() && !r.middle());
+        let r = dock_mouse(1 << 1);
+        assert!(r.right() && !r.left() && !r.middle());
+        let r = dock_mouse(1 << 2);
+        assert!(r.middle() && !r.left() && !r.right());
+        // Back, forward and anything else are not the 3DO's.
+        let r = dock_mouse((1 << 3) | (1 << 4) | 0x3FFF_FFE0);
+        assert!(!r.left() && !r.right() && !r.middle());
+        assert_eq!(button::BACK, 1 << 3);
+        assert_eq!(button::FORWARD, 1 << 4);
+        // The movement is not a button.
+        let r = moved(-1, -1);
+        assert!(!r.left() && !r.right() && !r.middle());
+    }
+
+    #[test]
+    fn sensitivity_is_a_half() {
+        // One count of the mouse is half a unit: one count of the 3DO
+        // mouse, since the core doubles.
+        assert_eq!((SENSITIVITY_NUMERATOR, SENSITIVITY_DENOMINATOR), (1, 2));
+        let mut m = Motion::new();
+        m.add(2, -2);
+        assert_eq!(m.take(), (1, -1));
+        m.add(100, -300);
+        assert_eq!(m.take(), (50, -150));
+        assert!(!m.pending());
+    }
+
+    #[test]
+    fn motion_sums_reports_and_carries_the_fraction() {
+        let mut m = Motion::new();
+        assert!(!m.pending());
+        assert_eq!(m.take(), (0, 0));
+        // The reports between two packets add up: 3 + 4 + 2 = 9 counts
+        // right, 1 + 1 + 1 = 3 down...
+        m.add(3, 1);
+        m.add(4, 1);
+        m.add(2, 1);
+        assert!(m.pending());
+        // ...4.5 and 1.5 units: 4 and 1, half a unit carried on each.
+        assert_eq!(m.take(), (4, 1));
+        assert!(m.pending(), "the halves are kept");
+        assert_eq!(m.take(), (0, 0), "but a half is not a packet");
+        // Another count each completes them.
+        m.add(1, 1);
+        assert_eq!(m.take(), (1, 1));
+        assert!(!m.pending());
+        // One count at a time, both ways: every other take moves, none is
+        // lost.
+        let mut steps = Vec::new();
+        for _ in 0..10 {
+            m.add(1, -1);
+            steps.push(m.take());
+        }
+        assert_eq!(steps, [(0, 0), (1, -1)].repeat(5));
+        // Toward zero, the carry with the movement's sign.
+        m.add(-3, 3);
+        assert_eq!(m.take(), (-1, 1));
+        m.add(-1, 1);
+        assert_eq!(m.take(), (-1, 1));
+        assert!(!m.pending());
+        // A report back cancels the carry.
+        m.add(1, 0);
+        m.add(-1, 0);
+        assert_eq!(m.take(), (0, 0));
+        assert!(!m.pending());
+        // Reset forgets the carry.
+        m.add(1, 1);
+        m.reset();
+        assert!(!m.pending());
+        m.add(1, 1);
+        assert_eq!(m.take(), (0, 0));
+    }
+
+    #[test]
+    fn motion_is_clamped_and_the_excess_carried() {
+        let mut m = Motion::new();
+        // A jerk of 1000 counts right and 700 up: 500 and -350 units.
+        m.add(1000, -700);
+        assert_eq!(m.take(), (255, -255));
+        assert!(m.pending());
+        assert_eq!(
+            m.take(),
+            (245, -95),
+            "the rest in the next packet, nothing lost"
+        );
+        assert_eq!(m.take(), (0, 0));
+        assert!(!m.pending());
+        // The biggest reports there are, many of them: taken 255 at a
+        // time, the sum conserved to the half unit.
+        let n = 101;
+        for _ in 0..n {
+            m.add(i16::MAX, i16::MIN);
+        }
+        let expected = (
+            n as i64 * i16::MAX as i64 / 2,
+            n as i64 * i16::MIN as i64 / 2,
+        );
+        let mut total = (0i64, 0i64);
+        let mut packets = 0;
+        loop {
+            let (dx, dy) = m.take();
+            if (dx, dy) == (0, 0) {
+                break;
+            }
+            assert!(dx.abs() <= 255 && dy.abs() <= 255, "{dx} {dy}");
+            total.0 += dx as i64;
+            total.1 += dy as i64;
+            packets += 1;
+        }
+        assert_eq!(total, expected);
+        assert_eq!(packets, (expected.1.abs() + 254) / 255);
+        assert_eq!(
+            m,
+            Motion { x: 1, y: 0 },
+            "101 * 32767 counts is odd: half a unit left"
+        );
+    }
+
+    #[test]
+    fn physical_mouse_stream() {
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        // Taken with a mouse on the dock: the buttons are written (released).
+        assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
+        // The first report after a while: written at once.
+        m.report(&moved(3, 0));
+        assert_eq!(
+            writes(&m.update(1, false, &physical(0))),
+            [(0x1030, pack_motion(1, 0))]
+        );
+        // The reports in the next 8 ms are summed, not written yet: with
+        // the half carried, 1 + 3 + 2 = 6 half units right, 5 up.
+        m.report(&moved(3, 0));
+        assert!(m.update(3, false, &physical(0)).is_empty());
+        m.report(&moved(2, -5));
+        assert!(m.update(5, false, &physical(0)).is_empty());
+        // The tick 7 ms after the packet: not due.
+        assert!(m.update(8, false, &physical(0)).is_empty());
+        // Due: 3 units right, -2.5 so -2 up, the half carried.
+        assert_eq!(
+            writes(&m.update(9, false, &physical(0))),
+            [(0x1030, pack_motion(3, -2))]
+        );
+        // Nothing new: the ticks write nothing (half a unit is not a
+        // packet).
+        assert!(m.update(17, false, &physical(0)).is_empty());
+        assert!(m.update(25, false, &physical(0)).is_empty());
+        // The latest report's movement is not counted by an update, however
+        // many: it was counted when it arrived.
+        let same = MouseInput {
+            mouse: Some(moved(100, 100)),
+            ..MouseInput::default()
+        };
+        assert!(m.update(33, false, &same).is_empty());
+        assert!(m.update(41, false, &same).is_empty());
+        // Another count up completes the carried half: at once, due since 9.
+        m.report(&moved(0, -1));
+        assert_eq!(
+            writes(&m.update(42, false, &physical(0))),
+            [(0x1030, pack_motion(0, -1))]
+        );
+        // Left pressed, no movement: the button at once, alone.
+        m.report(&dock_mouse(button::LEFT));
+        assert_eq!(
+            writes(&m.update(43, false, &physical(button::LEFT))),
+            [(0x1034, 0b001)]
+        );
+        // Held: nothing.
+        m.report(&dock_mouse(button::LEFT));
+        assert!(m.update(44, false, &physical(button::LEFT)).is_empty());
+        // Moved as it is released and the middle one pressed, 8 ms on:
+        // motion first, then the buttons.
+        m.report(&MouseReport {
+            dx: -2,
+            dy: 4,
+            ..dock_mouse(button::MIDDLE)
+        });
+        assert_eq!(
+            writes(&m.update(51, false, &physical(button::MIDDLE))),
+            [(0x1030, pack_motion(-1, 2)), (0x1034, 0b100)]
+        );
+        // All three, and the handheld's R too: one right button.
+        let all = MouseInput {
+            handheld_r: true,
+            ..physical(button::LEFT | button::RIGHT | button::MIDDLE)
+        };
+        assert_eq!(writes(&m.update(52, false, &all)), [(0x1034, 0b111)]);
+        // Back, forward and the wheel do nothing.
+        let other = button::BACK | button::FORWARD;
+        m.report(&MouseReport {
+            wheel: -3,
+            ..dock_mouse(other)
+        });
+        assert_eq!(
+            writes(&m.update(60, false, &physical(other))),
+            [(0x1034, 0)]
+        );
+        assert!(m.update(68, false, &physical(other)).is_empty());
+    }
+
+    #[test]
+    fn physical_mouse_clamps_a_packet_and_carries_the_rest() {
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        m.update(0, false, &physical(0));
+        // 300 reports of 4 counts right and 1 up before the next update
+        // (a fast mouse, a fast hand): 600 units right, 150 up. The packet
+        // is clamped; the rest waits for the next ones, 8 ms apart.
+        for _ in 0..300 {
+            m.report(&moved(4, -1));
+        }
+        assert_eq!(
+            writes(&m.update(1, false, &physical(0))),
+            [(0x1030, pack_motion(255, -150))]
+        );
+        assert!(m.update(5, false, &physical(0)).is_empty(), "not due");
+        assert_eq!(
+            writes(&m.update(9, false, &physical(0))),
+            [(0x1030, pack_motion(255, 0))]
+        );
+        assert_eq!(
+            writes(&m.update(17, false, &physical(0))),
+            [(0x1030, pack_motion(90, 0))]
+        );
+        assert!(m.update(25, false, &physical(0)).is_empty());
+    }
+
+    #[test]
+    fn physical_mouse_wins_over_the_stick() {
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        // A pad with its stick full right-down and R1, L1, R3 held, and a
+        // mouse: the mouse's buttons (none), not the pad's.
+        let both = MouseInput {
+            stick_x: FULL,
+            stick_y: FULL,
+            pad_r1: true,
+            pad_l1: true,
+            pad_r3: true,
+            ..physical(0)
+        };
+        assert_eq!(writes(&m.update(0, false, &both)), [(0x1034, 0)]);
+        // The stick moves nothing, however long.
+        for t in 1..=100u64 {
+            assert!(m.update(8 * t, false, &both).is_empty(), "at {}", 8 * t);
+        }
+        // The mouse's buttons do...
+        let both_left = MouseInput {
+            mouse: Some(dock_mouse(button::LEFT)),
+            ..both
+        };
+        assert_eq!(writes(&m.update(900, false, &both_left)), [(0x1034, 0b001)]);
+        // ...as the handheld's.
+        let both_left_r = MouseInput {
+            handheld_r: true,
+            ..both_left
+        };
+        assert_eq!(
+            writes(&m.update(901, false, &both_left_r)),
+            [(0x1034, 0b011)]
+        );
+        // The mouse's movement does (11 counts: 5 units, a half carried).
+        m.report(&moved(11, 0));
+        assert_eq!(
+            writes(&m.update(910, false, &both_left_r)),
+            [(0x1030, pack_motion(5, 0))]
+        );
+        // The mouse goes (unplugged), the stick still full with the pad's
+        // buttons held: those are the mouse's now...
+        let stick_only = MouseInput {
+            mouse: None,
+            ..both
+        };
+        assert_eq!(
+            writes(&m.update(920, false, &stick_only)),
+            [(0x1034, 0b111)]
+        );
+        // ...and the stick moves it from here on, not for the time it was
+        // held while the mouse was there.
+        assert!(m.update(921, false, &stick_only).is_empty());
+        assert_eq!(
+            writes(&m.update(928, false, &stick_only)),
+            [(0x1030, pack_motion(2, 2))]
+        );
+        // The mouse back: the stick stops at once and the pad's buttons go
+        // (the mouse's are released); the mouse starts afresh, the half it
+        // had carried gone with it (1 count right: a half again, not one).
+        m.report(&moved(1, 2));
+        assert_eq!(
+            writes(&m.update(936, false, &both)),
+            [(0x1030, pack_motion(0, 1)), (0x1034, 0)]
+        );
+        assert!(m.update(944, false, &both).is_empty());
+        assert!(m.update(1000, false, &both).is_empty());
+        // Gone again after a long while: the stick starts over too, with no
+        // catch-up for the time the mouse was there (not even a step).
+        assert_eq!(
+            writes(&m.update(1500, false, &stick_only)),
+            [(0x1034, 0b111)]
+        );
+        assert_eq!(
+            writes(&m.update(1508, false, &stick_only)),
+            [(0x1030, pack_motion(2, 2))]
+        );
+    }
+
+    #[test]
+    fn physical_mouse_yields_to_a_connected_gun() {
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        assert_eq!(
+            writes(&m.update(0, false, &physical(button::LEFT))),
+            [(0x1034, 0b001)]
+        );
+        m.report(&moved(6, 6));
+        assert_eq!(
+            writes(&m.update(8, false, &physical(button::LEFT))),
+            [(0x1030, pack_motion(3, 3))]
+        );
+        // A gun is plugged in: the button is released; the mouse's reports
+        // go nowhere.
+        m.report(&moved(6, 6));
+        assert_eq!(
+            writes(&m.update(16, true, &physical(button::LEFT))),
+            [(0x1034, 0)]
+        );
+        for t in 3..100u64 {
+            m.report(&moved(6, 6));
+            assert!(m.update(8 * t, true, &physical(button::LEFT)).is_empty());
+        }
+        assert!(m.enabled(), "still the core's mouse, waiting");
+        // Gone: the button is written again; what moved meanwhile is not.
+        assert_eq!(
+            writes(&m.update(1000, false, &physical(button::LEFT))),
+            [(0x1034, 0b001)]
+        );
+        assert!(m.update(1008, false, &physical(button::LEFT)).is_empty());
+        m.report(&moved(-2, 0));
+        assert_eq!(
+            writes(&m.update(1016, false, &physical(button::LEFT))),
+            [(0x1030, pack_motion(-1, 0))]
+        );
+    }
+
+    #[test]
+    fn physical_mouse_reports_are_dropped_while_not_selected() {
+        let mut m = Mouse::new();
+        // No core: a report is not kept.
+        m.report(&moved(100, 100));
+        assert!(!m.motion.pending());
+        assert!(m.update(0, false, &physical(0)).is_empty());
+        // The 3DO with the pad only: not kept either...
+        m.set_target(Some(TARGET_3DO), CONTROLLER_PAD);
+        assert!(!m.enabled());
+        m.report(&moved(100, 100));
+        assert!(!m.motion.pending());
+        assert!(m.update(10, false, &physical(0)).is_empty());
+        // ...for when the mouse is selected (the setting changed in the
+        // menu: the target is set again).
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        assert_eq!(writes(&m.update(20, false, &physical(0))), [(0x1034, 0)]);
+        assert!(m.update(28, false, &physical(0)).is_empty());
+        // Now they count.
+        m.report(&moved(2, 2));
+        assert!(m.motion.pending());
+        assert_eq!(
+            writes(&m.update(36, false, &physical(0))),
+            [(0x1030, pack_motion(1, 1))]
+        );
+        // The core lost the focus: dropped again.
+        m.set_target(None, CONTROLLER_MOUSE);
+        m.report(&moved(100, 100));
+        assert!(!m.motion.pending());
+        assert!(m.update(44, false, &physical(0)).is_empty());
     }
 
     #[test]

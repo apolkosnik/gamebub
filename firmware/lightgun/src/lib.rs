@@ -1,9 +1,10 @@
 //! Light gun support: a GunCon 3 on the dock, aimed into a core.
 //!
 //! The dock reports a light gun as an ordinary gamepad (`GamepadData`) with
-//! bit 31 of its buttons set: the left stick is the aim (X, Y: signed, 0 in
-//! the centre, positive right / down), the left Z axis the distance to the
-//! emitters, the right stick the gun's stick A. A core that takes a light gun
+//! bit 31 of its buttons set (a mouse has bit 30, see `mouse`): the left
+//! stick is the aim (X, Y: signed, 0 in the centre, positive right / down),
+//! the left Z axis the distance to the emitters, the right stick the gun's
+//! stick A. A core that takes a light gun
 //! (see `target_for_core`) gets, over the host memory interface:
 //!
 //!  * `Target::enable`: 1 while a gun is connected; otherwise the value of
@@ -21,8 +22,9 @@
 //! picture's top-left corner and pull the trigger, then at its bottom-right
 //! corner and pull the trigger.
 //!
-//! The `mouse` module drives the same core's mouse from a dock gamepad's
-//! right stick (and the handheld's own L and R as its buttons).
+//! The `mouse` module drives the same core's mouse from a mouse on the dock,
+//! or else from a dock gamepad's right stick (and the handheld's own L and
+//! R as its buttons either way).
 //!
 //! Everything here is pure logic, without the firmware's dependencies, so it
 //! runs on the host: `cargo test` in this directory.

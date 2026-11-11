@@ -1,7 +1,7 @@
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
-use lightgun::mouse::{self, Mouse, MouseInput};
+use lightgun::mouse::{self, Mouse, MouseInput, MouseReport};
 use lightgun::{CalibrationEvent, GunReport};
 
 use crate::device::drivers::fpga;
@@ -55,7 +55,8 @@ pub struct InputState {
     pub axis_rz: i16,
 
     /// A dock gamepad's buttons word as received (0 for the handheld's own
-    /// buttons): bit 31 marks a light gun, whose buttons are only here.
+    /// buttons): bit 31 marks a light gun, bit 30 a mouse, whose buttons
+    /// are only here.
     pub raw_buttons: u32,
 }
 
@@ -71,6 +72,22 @@ impl InputState {
             x: self.axis_lx,
             y: self.axis_ly,
             z: self.axis_lz as u16,
+            buttons: self.raw_buttons,
+        }
+    }
+
+    /// Whether this is a mouse on the dock: its left stick is its movement
+    /// since the previous report, its left Z the wheel's. A mouse is never
+    /// a gamepad (`InputManager::send_event`).
+    pub fn is_mouse(&self) -> bool {
+        MouseReport::is_mouse(self.raw_buttons)
+    }
+
+    pub fn mouse_report(&self) -> MouseReport {
+        MouseReport {
+            dx: self.axis_lx,
+            dy: self.axis_ly,
+            wheel: self.axis_lz,
             buttons: self.raw_buttons,
         }
     }
@@ -175,8 +192,9 @@ pub struct InputManager {
     /// The light gun of the running core, if it takes one.
     light_gun: lightgun::Controller,
 
-    /// The mouse of the running core, if it takes one: a dock pad's right
-    /// stick, while the core's Controller setting selects the mouse.
+    /// The mouse of the running core, if it takes one: a dock mouse, or
+    /// else a dock pad's right stick, while the core's Controller setting
+    /// selects the mouse.
     mouse: Mouse,
 
     /// Time base for the light gun and the mouse (its first use).
@@ -232,16 +250,29 @@ impl InputManager {
     }
 
     pub fn update_gamepad(&mut self, id: GamepadId, state: InputState) {
-        if let Some(gamepad) = self.find_gamepad(id) {
-            gamepad.state = state;
+        let Some(gamepad) = self.find_gamepad(id) else {
+            return;
+        };
+        gamepad.state = state;
 
-            if crate::kvs::keys::DOCK_SWAP_ABXY.get().unwrap() {
-                std::mem::swap(&mut gamepad.state.btn_a, &mut gamepad.state.btn_b);
-                std::mem::swap(&mut gamepad.state.btn_x, &mut gamepad.state.btn_y);
-            }
-
-            self.send_event();
+        if crate::kvs::keys::DOCK_SWAP_ABXY.get().unwrap() {
+            std::mem::swap(&mut gamepad.state.btn_a, &mut gamepad.state.btn_b);
+            std::mem::swap(&mut gamepad.state.btn_x, &mut gamepad.state.btn_y);
         }
+
+        // A mouse's report is a movement since the previous one: it is
+        // counted here, once, as it arrives (the state kept above is the
+        // same report until the next, so `send_mouse` reads only its
+        // buttons from it).
+        let mouse_report = gamepad
+            .state
+            .is_mouse()
+            .then(|| gamepad.state.mouse_report());
+        if let Some(report) = mouse_report {
+            self.mouse.report(&report);
+        }
+
+        self.send_event();
     }
 
     /// Send an input event to the UI thread, if needed.
@@ -253,6 +284,11 @@ impl InputManager {
         for gamepad in &self.gamepads {
             // A light gun the core takes as one is not a gamepad.
             if gamepad.state.is_light_gun() && self.light_gun.active() {
+                continue;
+            }
+            // A mouse never is: its movement is not a stick (it would press
+            // the d-pad), its buttons are not the pad's (`lightgun::mouse`).
+            if gamepad.state.is_mouse() {
                 continue;
             }
             let pad = gamepad.state.as_pad();
@@ -332,6 +368,7 @@ impl InputManager {
             let registers = match self.gamepads.get(i) {
                 None => [0, 0],
                 Some(gamepad) if gamepad.state.is_light_gun() && self.light_gun.active() => [0, 0],
+                Some(gamepad) if gamepad.state.is_mouse() => [0, 0],
                 Some(gamepad) => gamepad.state.as_pad().gamepad_registers(),
             };
             if *last != Some(registers) {
@@ -380,7 +417,7 @@ impl InputManager {
             log::info!(
                 "Mouse: {}",
                 if self.mouse.enabled() {
-                    "the first dock pad's right stick"
+                    "a dock mouse, else the first dock pad's right stick"
                 } else {
                     "off"
                 }
@@ -459,17 +496,18 @@ impl InputManager {
         )));
     }
 
-    /// What drives the mouse: the first dock gamepad that is not a light
-    /// gun (its right stick, R1, L1 and R3; nothing without one), and the
-    /// handheld's own L and R. The pad's buttons also reach the core as the
-    /// pad's, as they always do.
+    /// What drives the mouse: the first dock mouse (its latest report, for
+    /// its buttons; its movement went in through `update_gamepad`), else
+    /// the first dock gamepad that is neither a light gun nor a mouse (its
+    /// right stick, R1, L1 and R3; nothing without one); and the handheld's
+    /// own L and R. The pad's buttons also reach the core as the pad's, as
+    /// they always do.
     fn mouse_input(&self) -> MouseInput {
-        let pad = self
-            .gamepads
-            .iter()
-            .map(|gamepad| &gamepad.state)
-            .find(|state| !state.is_light_gun());
+        let states = || self.gamepads.iter().map(|gamepad| &gamepad.state);
+        let mouse = states().find(|state| state.is_mouse());
+        let pad = states().find(|state| !state.is_light_gun() && !state.is_mouse());
         MouseInput {
+            mouse: mouse.map(|mouse| mouse.mouse_report()),
             stick_x: pad.map_or(0, |pad| pad.axis_rx),
             stick_y: pad.map_or(0, |pad| pad.axis_ry),
             pad_r1: pad.is_some_and(|pad| pad.btn_r1),
@@ -483,8 +521,10 @@ impl InputManager {
     /// Write the mouse (movement since the last packet, buttons) to the
     /// core that takes it, where there is any: on every input event, and on
     /// the mouse tick in between, since a pad only reports when something
-    /// changes and a stick held still must keep the mouse moving. A
-    /// connected light gun is the core's instead (`lightgun::mouse`).
+    /// changes and a stick held still must keep the mouse moving (and a
+    /// dock mouse's last reports before it stops are written by the tick
+    /// when the packet is due). A connected light gun is the core's instead
+    /// (`lightgun::mouse`).
     fn send_mouse(&mut self) {
         if !self.mouse.enabled() {
             return;
