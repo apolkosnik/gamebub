@@ -6,7 +6,10 @@
 //! emitters, the right stick the gun's stick A. A core that takes a light gun
 //! (see `target_for_core`) gets, over the host memory interface:
 //!
-//!  * `Target::enable`: 1 while a gun is connected, 0 otherwise;
+//!  * `Target::enable`: 1 while a gun is connected; otherwise the value of
+//!    the core's Controller setting, which the register also is (0 pad
+//!    only, 2 pad + mouse, see `mouse`), so a connected gun wins and an
+//!    unplugged one gives the mouse back;
 //!  * `Target::aim`: `{y[31:16], x[15:0]}`, each 0..65535 across the picture
 //!    (0 the left / top edge), see `pack_aim`;
 //!  * `Target::buttons`: bit 0 trigger, bit 1 option, bit 2 off screen, see
@@ -18,10 +21,15 @@
 //! picture's top-left corner and pull the trigger, then at its bottom-right
 //! corner and pull the trigger.
 //!
+//! The `mouse` module drives the same core's mouse from a dock gamepad's
+//! right stick (and the handheld's own L and R as its buttons).
+//!
 //! Everything here is pure logic, without the firmware's dependencies, so it
 //! runs on the host: `cargo test` in this directory.
 
 #![cfg_attr(not(test), no_std)]
+
+pub mod mouse;
 
 /// The dock's light gun buttons (bits of `GamepadData`'s buttons word).
 pub mod button {
@@ -87,7 +95,8 @@ impl GunReport {
 /// Where a core takes a light gun: addresses on the host memory interface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// 1: a light gun on the control port (with the pad), 0: pad only.
+    /// The core's Controller register (also its setting): 1 a light gun on
+    /// the control port (with the pad), 0 pad only, 2 a mouse (`mouse`).
     pub enable: u32,
     /// The aim, `pack_aim`.
     pub aim: u32,
@@ -392,7 +401,12 @@ pub struct Controller {
     /// Held back from the core until the trigger is released (calibrating,
     /// or just finished calibrating with the trigger still pulled).
     hold_back: bool,
-    sent_enable: Option<bool>,
+    /// The Controller register's value while no gun is connected: the
+    /// core's Controller setting (`mouse::CONTROLLER_*`), which the
+    /// firmware wrote from the settings; written back when a gun goes.
+    without_gun: u32,
+    /// The Controller register's value as last written.
+    sent_enable: Option<u32>,
     sent_aim: Option<u32>,
     sent_buttons: Option<u32>,
     last_aim_write: Option<u64>,
@@ -414,6 +428,7 @@ impl Controller {
             },
             calibrator: Calibrator::new(),
             hold_back: false,
+            without_gun: mouse::CONTROLLER_PAD,
             sent_enable: None,
             sent_aim: None,
             sent_buttons: None,
@@ -422,14 +437,27 @@ impl Controller {
     }
 
     /// The core taking the gun now (None: no core, or one without a gun, or
-    /// not running), with its calibration. Everything is written again on
-    /// the next `update`.
-    pub fn set_target(&mut self, target: Option<Target>, calibration: Calibration) {
+    /// not running), with its calibration and the value of its Controller
+    /// setting (`mouse::CONTROLLER_*`): what the register holds without a
+    /// gun (the pad alone, or the pad and the mouse). Everything is written
+    /// again on the next `update`.
+    pub fn set_target(
+        &mut self,
+        target: Option<Target>,
+        calibration: Calibration,
+        controller_setting: u32,
+    ) {
         *self = Controller {
             target,
             calibration,
+            without_gun: controller_setting,
             ..Self::new()
         };
+    }
+
+    /// The Controller register's value without a gun (`set_target`).
+    pub fn controller_setting(&self) -> u32 {
+        self.without_gun
     }
 
     /// Whether a core takes the gun now (the gun is then the core's, not a
@@ -454,8 +482,9 @@ impl Controller {
     /// writes for the core, and what calibration has to say.
     ///
     /// Connecting writes aim and buttons, then enable = 1; disconnecting
-    /// releases the buttons, then writes enable = 0. A button change is
-    /// written at once; a moving aim at most every `MIN_AIM_INTERVAL_MS`.
+    /// releases the buttons, then writes enable = the Controller setting's
+    /// value (0 pad only, 2 pad + mouse: the mouse goes on). A button change
+    /// is written at once; a moving aim at most every `MIN_AIM_INTERVAL_MS`.
     /// While calibrating the core sees the trigger and option released and
     /// the gun off screen.
     pub fn update(
@@ -475,9 +504,9 @@ impl Controller {
                 writes.push(target.buttons, BUTTONS_RELEASED);
                 self.sent_buttons = Some(BUTTONS_RELEASED);
             }
-            if self.sent_enable != Some(false) {
-                writes.push(target.enable, 0);
-                self.sent_enable = Some(false);
+            if self.sent_enable != Some(self.without_gun) {
+                writes.push(target.enable, self.without_gun);
+                self.sent_enable = Some(self.without_gun);
             }
             return (writes, None);
         };
@@ -510,9 +539,9 @@ impl Controller {
             self.sent_buttons = Some(buttons);
             self.last_aim_write = Some(now_ms);
         }
-        if self.sent_enable != Some(true) {
-            writes.push(target.enable, 1);
-            self.sent_enable = Some(true);
+        if self.sent_enable != Some(mouse::CONTROLLER_LIGHT_GUN) {
+            writes.push(target.enable, mouse::CONTROLLER_LIGHT_GUN);
+            self.sent_enable = Some(mouse::CONTROLLER_LIGHT_GUN);
         }
         (writes, event)
     }
@@ -822,7 +851,7 @@ mod tests {
         assert!(w.is_empty() && e.is_none());
         let (w, _) = c.update(10, None);
         assert!(w.is_empty());
-        c.set_target(target_for_core("Game-Bub.GB"), Calibration::default());
+        c.set_target(target_for_core("Game-Bub.GB"), Calibration::default(), 0);
         assert!(!c.active());
         assert!(c.update(20, Some(&gun(0, 0, TRIGGER))).0.is_empty());
     }
@@ -830,7 +859,7 @@ mod tests {
     #[test]
     fn controller_connect_stream_disconnect() {
         let mut c = Controller::new();
-        c.set_target(Some(TARGET_3DO), Calibration::default());
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
         // Activated with no gun: pad only.
         assert_eq!(writes(&c.update(0, None).0), [(0x101C, 0b100), (0x1014, 0)]);
         assert!(c.update(5, None).0.is_empty());
@@ -892,12 +921,12 @@ mod tests {
     #[test]
     fn controller_rewrites_everything_on_new_target() {
         let mut c = Controller::new();
-        c.set_target(Some(TARGET_3DO), Calibration::default());
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
         let report = gun(0, 0, 0);
         assert_eq!(c.update(0, Some(&report)).0.as_slice().len(), 3);
         assert!(c.update(100, Some(&report)).0.is_empty());
         // Refocused (or a new core): written again.
-        c.set_target(Some(TARGET_3DO), Calibration::default());
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
         assert_eq!(
             writes(&c.update(101, Some(&report)).0),
             [(0x1018, 0x8000_8000), (0x101C, 0), (0x1014, 1)]
@@ -905,10 +934,52 @@ mod tests {
     }
 
     #[test]
+    fn controller_restores_the_setting_without_a_gun() {
+        let mut c = Controller::new();
+        c.set_target(
+            Some(TARGET_3DO),
+            Calibration::default(),
+            mouse::CONTROLLER_MOUSE,
+        );
+        assert_eq!(c.controller_setting(), 2);
+        // No gun: the register holds the setting (the mouse), as the
+        // firmware wrote it from the settings.
+        assert_eq!(writes(&c.update(0, None).0), [(0x101C, 0b100), (0x1014, 2)]);
+        assert!(c.update(5, None).0.is_empty());
+        // A gun plugged in wins...
+        assert_eq!(
+            writes(&c.update(10, Some(&gun(0, 0, 0))).0),
+            [(0x1018, 0x8000_8000), (0x101C, 0), (0x1014, 1)]
+        );
+        assert!(c.update(15, Some(&gun(0, 0, 0))).0.is_empty());
+        // ...and unplugged gives the mouse back.
+        assert_eq!(
+            writes(&c.update(20, None).0),
+            [(0x101C, 0b100), (0x1014, 2)]
+        );
+        // "Pad + light gun" chosen with no gun: the setting stands too.
+        c.set_target(
+            Some(TARGET_3DO),
+            Calibration::default(),
+            mouse::CONTROLLER_LIGHT_GUN,
+        );
+        assert_eq!(
+            writes(&c.update(30, None).0),
+            [(0x101C, 0b100), (0x1014, 1)]
+        );
+        assert_eq!(
+            writes(&c.update(40, Some(&gun(0, 0, 0))).0),
+            [(0x1018, 0x8000_8000), (0x101C, 0)],
+            "aim and buttons, enable already 1"
+        );
+        assert_eq!(writes(&c.update(50, None).0), [(0x101C, 0b100)]);
+    }
+
+    #[test]
     fn controller_uses_calibration() {
         let cal = Calibration::from_corners((-20000, -10000), (20000, 10000)).unwrap();
         let mut c = Controller::new();
-        c.set_target(Some(TARGET_3DO), cal);
+        c.set_target(Some(TARGET_3DO), cal, 0);
         let (w, _) = c.update(0, Some(&gun(-20000, -10000, 0)));
         assert_eq!(w.as_slice()[0], (0x1018, 0));
         let (w, _) = c.update(100, Some(&gun(-30000, 30000, 0)));
@@ -922,7 +993,7 @@ mod tests {
     #[test]
     fn controller_calibration_holds_back_the_trigger() {
         let mut c = Controller::new();
-        c.set_target(Some(TARGET_3DO), Calibration::default());
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
         let mut t = 0;
         c.update(t, Some(&gun(0, 0, 0)));
         for _ in 0..3 {

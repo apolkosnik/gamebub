@@ -1,6 +1,7 @@
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
+use lightgun::mouse::{self, Mouse, MouseInput};
 use lightgun::{CalibrationEvent, GunReport};
 
 use crate::device::drivers::fpga;
@@ -174,7 +175,11 @@ pub struct InputManager {
     /// The light gun of the running core, if it takes one.
     light_gun: lightgun::Controller,
 
-    /// Time base for the light gun (its first use).
+    /// The mouse of the running core, if it takes one: a dock pad's right
+    /// stick, while the core's Controller setting selects the mouse.
+    mouse: Mouse,
+
+    /// Time base for the light gun and the mouse (its first use).
     epoch: Option<Instant>,
 }
 
@@ -316,6 +321,7 @@ impl InputManager {
 
         self.send_gamepad_registers();
         self.send_light_gun();
+        self.send_mouse();
     }
 
     /// Write the gamepads, in the order they were connected, to the FPGA's
@@ -345,22 +351,60 @@ impl InputManager {
         self.send_gamepad_registers();
     }
 
-    /// The core taking a light gun now (None: none, or not running with
-    /// focus), see `lightgun::target_for_core`. Its calibration comes from
-    /// the KVS; its registers are all written again.
-    pub fn set_light_gun_target(&mut self, target: Option<lightgun::Target>) {
+    /// The core running with focus now (None: none), with the value of its
+    /// Controller setting (`lightgun::mouse::CONTROLLER_*`; 0 without one),
+    /// for the light gun and the mouse it takes, if any
+    /// (`lightgun::target_for_core`, `lightgun::mouse::target_for_core`):
+    /// their registers are all written again. The gun's calibration comes
+    /// from the KVS. The mouse tick (`ui::Message::MouseTick`) runs while
+    /// the core takes the mouse and the setting selects it.
+    pub fn set_core(&mut self, core_id: Option<&str>, controller: u32) {
+        let target = core_id.and_then(lightgun::target_for_core);
         let calibration = target
             .and_then(calibration_key)
             .and_then(|key| key.get())
             .and_then(lightgun::Calibration::from_words)
             .unwrap_or_default();
         if target.is_some() {
-            log::info!("Light gun: core takes one, calibration {:?}", calibration);
+            log::info!(
+                "Light gun: core takes one (Controller setting {controller}), calibration {:?}",
+                calibration
+            );
         }
-        self.light_gun.set_target(target, calibration);
+        self.light_gun.set_target(target, calibration, controller);
+
+        let was_ticking = self.mouse.enabled();
+        self.mouse
+            .set_target(core_id.and_then(mouse::target_for_core), controller);
+        if self.mouse.enabled() != was_ticking {
+            log::info!(
+                "Mouse: {}",
+                if self.mouse.enabled() {
+                    "the first dock pad's right stick"
+                } else {
+                    "off"
+                }
+            );
+            ui::send(ui::Message::MouseTick(self.mouse.enabled()));
+        }
         // The gun stops (or starts) being a gamepad, and the core's
         // registers are written.
         self.send_event();
+    }
+
+    /// Milliseconds since the light gun's or the mouse's first use.
+    fn now_ms(&mut self) -> u64 {
+        self.epoch
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    /// Whether a light gun is on the dock (the core's, while it takes one).
+    fn gun_connected(&self) -> bool {
+        self.gamepads
+            .iter()
+            .any(|gamepad| gamepad.state.is_light_gun())
     }
 
     /// Write the light gun (the first one on the dock) to the core that
@@ -379,11 +423,7 @@ impl InputManager {
             .iter()
             .find(|gamepad| gamepad.state.is_light_gun())
             .map(|gamepad| gamepad.state.gun_report());
-        let now = self
-            .epoch
-            .get_or_insert_with(Instant::now)
-            .elapsed()
-            .as_millis() as u64;
+        let now = self.now_ms();
         let (writes, event) = self.light_gun.update(now, report.as_ref());
         if !writes.is_empty() {
             let mut device = Device::lock();
@@ -417,6 +457,54 @@ impl InputManager {
         ui::send(ui::Message::Notification(ui::Notification::new_long(
             text.to_string(),
         )));
+    }
+
+    /// What drives the mouse: the first dock gamepad that is not a light
+    /// gun (its right stick, R1, L1 and R3; nothing without one), and the
+    /// handheld's own L and R. The pad's buttons also reach the core as the
+    /// pad's, as they always do.
+    fn mouse_input(&self) -> MouseInput {
+        let pad = self
+            .gamepads
+            .iter()
+            .map(|gamepad| &gamepad.state)
+            .find(|state| !state.is_light_gun());
+        MouseInput {
+            stick_x: pad.map_or(0, |pad| pad.axis_rx),
+            stick_y: pad.map_or(0, |pad| pad.axis_ry),
+            pad_r1: pad.is_some_and(|pad| pad.btn_r1),
+            pad_l1: pad.is_some_and(|pad| pad.btn_l1),
+            pad_r3: pad.is_some_and(|pad| pad.btn_r3),
+            handheld_l: self.internal_state.btn_l1,
+            handheld_r: self.internal_state.btn_r1,
+        }
+    }
+
+    /// Write the mouse (movement since the last packet, buttons) to the
+    /// core that takes it, where there is any: on every input event, and on
+    /// the mouse tick in between, since a pad only reports when something
+    /// changes and a stick held still must keep the mouse moving. A
+    /// connected light gun is the core's instead (`lightgun::mouse`).
+    fn send_mouse(&mut self) {
+        if !self.mouse.enabled() {
+            return;
+        }
+        let input = self.mouse_input();
+        let gun_connected = self.gun_connected();
+        let now = self.now_ms();
+        let writes = self.mouse.update(now, gun_connected, &input);
+        if !writes.is_empty() {
+            let mut device = Device::lock();
+            for &(address, value) in writes.as_slice() {
+                let _ = device.fpga.write_u32(address, value);
+            }
+        }
+    }
+
+    /// The mouse tick (`ui::Message::MouseTick`, every
+    /// `lightgun::mouse::MIN_MOTION_INTERVAL_MS` while the mouse is on).
+    pub fn mouse_tick(&mut self) {
+        self.send_mouse();
     }
 }
 

@@ -347,7 +347,7 @@ impl CoreManager {
     }
 
     fn reset_state(&mut self) {
-        InputManager::lock().set_light_gun_target(None);
+        InputManager::lock().set_core(None, 0);
         self.core_info = None;
         self.core_handler = CoreHandlerImpl::None;
         self.core_settings = None;
@@ -499,13 +499,21 @@ impl CoreManager {
                 // (The first time after loading the bitstream, they are cleared.)
                 input.resend_gamepad_registers();
             }
-            // A dock light gun goes to a core that takes one while it runs
-            // with focus; otherwise it is a gamepad (for the menus).
-            let light_gun = match (&self.core_info, has_focus && self.stage == Stage::Running) {
-                (Some(core), true) => lightgun::target_for_core(&core.id),
-                _ => None,
-            };
-            input.set_light_gun_target(light_gun);
+            // A dock light gun, or a dock pad's right stick as a mouse, goes
+            // to a core that takes them while it runs with focus; otherwise
+            // a gun is a gamepad (for the menus). Which one, the core's
+            // Controller setting (the register the gun enables) says: its
+            // current value is passed here, so a change in the settings
+            // menu (which takes the focus) is taken when the game goes on.
+            let core = self
+                .core_info
+                .as_ref()
+                .filter(|_| has_focus && self.stage == Stage::Running);
+            let controller = core
+                .and_then(|core| lightgun::target_for_core(&core.id))
+                .and_then(|target| self.setting_value_at(target.enable))
+                .unwrap_or(0);
+            input.set_core(core.map(|core| core.id.as_str()), controller);
         }
 
         let _ = self.run_core_command(

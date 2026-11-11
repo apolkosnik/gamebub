@@ -219,6 +219,24 @@ impl CoreManager {
         }
     }
 
+    /// The current value of the core's setting at register `address` (the
+    /// value `setting_send` wrote, or will write), if the core has a
+    /// setting there.
+    pub(super) fn setting_value_at(&self, address: u32) -> Option<u32> {
+        let setting = self
+            .core_info
+            .as_ref()?
+            .settings
+            .iter()
+            .find(|setting| setting.address == address)?;
+        self.core_settings
+            .as_ref()?
+            .settings
+            .iter()
+            .find(|(id, _)| *id == setting.id)
+            .map(|(_, value)| *value)
+    }
+
     /// Send an updated setting to the FPGA.
     pub fn setting_send(&self, setting: &CoreSetting, value: u32) {
         let mut device = Device::lock();
