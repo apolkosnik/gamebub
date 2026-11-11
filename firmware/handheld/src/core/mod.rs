@@ -347,6 +347,7 @@ impl CoreManager {
     }
 
     fn reset_state(&mut self) {
+        InputManager::lock().set_light_gun_target(None);
         self.core_info = None;
         self.core_handler = CoreHandlerImpl::None;
         self.core_settings = None;
@@ -492,9 +493,19 @@ impl CoreManager {
                 .fpga
                 .write_u32(fpga::REG_CTRL_FOCUS, has_focus as u32);
         }
-        if has_focus {
-            // (The first time after loading the bitstream, they are cleared.)
-            InputManager::lock().resend_gamepad_registers();
+        {
+            let mut input = InputManager::lock();
+            if has_focus {
+                // (The first time after loading the bitstream, they are cleared.)
+                input.resend_gamepad_registers();
+            }
+            // A dock light gun goes to a core that takes one while it runs
+            // with focus; otherwise it is a gamepad (for the menus).
+            let light_gun = match (&self.core_info, has_focus && self.stage == Stage::Running) {
+                (Some(core), true) => lightgun::target_for_core(&core.id),
+                _ => None,
+            };
+            input.set_light_gun_target(light_gun);
         }
 
         let _ = self.run_core_command(

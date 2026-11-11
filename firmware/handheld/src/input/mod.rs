@@ -1,7 +1,11 @@
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Instant;
+
+use lightgun::{CalibrationEvent, GunReport};
 
 use crate::device::drivers::fpga;
 use crate::device::Device;
+use crate::kvs::KvsKey;
 use crate::ui::{self, ButtonMap};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -48,9 +52,40 @@ pub struct InputState {
     pub axis_rx: i16,
     pub axis_ry: i16,
     pub axis_rz: i16,
+
+    /// A dock gamepad's buttons word as received (0 for the handheld's own
+    /// buttons): bit 31 marks a light gun, whose buttons are only here.
+    pub raw_buttons: u32,
 }
 
 impl InputState {
+    /// Whether this is a light gun on the dock (a GunCon 3): its left stick
+    /// is its aim (all 16 bits), its left Z the distance to the emitters.
+    pub fn is_light_gun(&self) -> bool {
+        GunReport::is_light_gun(self.raw_buttons)
+    }
+
+    pub fn gun_report(&self) -> GunReport {
+        GunReport {
+            x: self.axis_lx,
+            y: self.axis_ly,
+            z: self.axis_lz as u16,
+            buttons: self.raw_buttons,
+        }
+    }
+
+    /// The state as a gamepad: a light gun's aim and distance are not
+    /// sticks or a trigger.
+    fn as_pad(&self) -> InputState {
+        let mut state = self.clone();
+        if self.is_light_gun() {
+            state.axis_lx = 0;
+            state.axis_ly = 0;
+            state.axis_lz = 0;
+        }
+        state
+    }
+
     fn merge_axis(a: &mut i16, b: i16) {
         if b.unsigned_abs() > a.unsigned_abs() {
             *a = b;
@@ -135,6 +170,12 @@ pub struct InputManager {
 
     /// Last gamepad registers written to the FPGA (None: to be written).
     last_gamepad_registers: [Option<[u32; 2]>; fpga::REG_CTRL_GAMEPAD_COUNT],
+
+    /// The light gun of the running core, if it takes one.
+    light_gun: lightgun::Controller,
+
+    /// Time base for the light gun (its first use).
+    epoch: Option<Instant>,
 }
 
 impl InputManager {
@@ -205,19 +246,24 @@ impl InputManager {
         // TODO: handle button remapping before merge
         let mut state = self.internal_state.clone();
         for gamepad in &self.gamepads {
-            state.merge(&gamepad.state);
+            // A light gun the core takes as one is not a gamepad.
+            if gamepad.state.is_light_gun() && self.light_gun.active() {
+                continue;
+            }
+            let pad = gamepad.state.as_pad();
+            state.merge(&pad);
 
             // Temporary: map left analog stick to DPAD
-            if gamepad.state.axis_lx <= -16384 {
+            if pad.axis_lx <= -16384 {
                 state.btn_left = true;
             }
-            if gamepad.state.axis_lx >= 16384 {
+            if pad.axis_lx >= 16384 {
                 state.btn_right = true;
             }
-            if gamepad.state.axis_ly <= -16384 {
+            if pad.axis_ly <= -16384 {
                 state.btn_up = true;
             }
-            if gamepad.state.axis_ly >= 16384 {
+            if pad.axis_ly >= 16384 {
                 state.btn_down = true;
             }
         }
@@ -269,6 +315,7 @@ impl InputManager {
         self.last_button_map = buttons;
 
         self.send_gamepad_registers();
+        self.send_light_gun();
     }
 
     /// Write the gamepads, in the order they were connected, to the FPGA's
@@ -276,10 +323,11 @@ impl InputManager {
     /// buttons; other bitstreams ignore the writes), where they changed.
     fn send_gamepad_registers(&mut self) {
         for (i, last) in self.last_gamepad_registers.iter_mut().enumerate() {
-            let registers = self
-                .gamepads
-                .get(i)
-                .map_or([0, 0], |gamepad| gamepad.state.gamepad_registers());
+            let registers = match self.gamepads.get(i) {
+                None => [0, 0],
+                Some(gamepad) if gamepad.state.is_light_gun() && self.light_gun.active() => [0, 0],
+                Some(gamepad) => gamepad.state.as_pad().gamepad_registers(),
+            };
             if *last != Some(registers) {
                 let address = fpga::REG_CTRL_GAMEPADS + 8 * i as u32;
                 let mut device = Device::lock();
@@ -296,4 +344,83 @@ impl InputManager {
         self.last_gamepad_registers = Default::default();
         self.send_gamepad_registers();
     }
+
+    /// The core taking a light gun now (None: none, or not running with
+    /// focus), see `lightgun::target_for_core`. Its calibration comes from
+    /// the KVS; its registers are all written again.
+    pub fn set_light_gun_target(&mut self, target: Option<lightgun::Target>) {
+        let calibration = target
+            .and_then(calibration_key)
+            .and_then(|key| key.get())
+            .and_then(lightgun::Calibration::from_words)
+            .unwrap_or_default();
+        if target.is_some() {
+            log::info!("Light gun: core takes one, calibration {:?}", calibration);
+        }
+        self.light_gun.set_target(target, calibration);
+        // The gun stops (or starts) being a gamepad, and the core's
+        // registers are written.
+        self.send_event();
+    }
+
+    /// Write the light gun (the first one on the dock) to the core that
+    /// takes it, where it changed, and tell the user how calibration goes.
+    ///
+    /// The core takes these as setting writes on the host memory interface,
+    /// at any time: they go through the FPGA's SPI port under the `Device`
+    /// lock, as a whole between the disc sectors and file data the core
+    /// asks for.
+    fn send_light_gun(&mut self) {
+        if !self.light_gun.active() {
+            return;
+        }
+        let report = self
+            .gamepads
+            .iter()
+            .find(|gamepad| gamepad.state.is_light_gun())
+            .map(|gamepad| gamepad.state.gun_report());
+        let now = self
+            .epoch
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        let (writes, event) = self.light_gun.update(now, report.as_ref());
+        if !writes.is_empty() {
+            let mut device = Device::lock();
+            for &(address, value) in writes.as_slice() {
+                let _ = device.fpga.write_u32(address, value);
+            }
+        }
+
+        let Some(event) = event else {
+            return;
+        };
+        let text = match event {
+            CalibrationEvent::Started => {
+                "Gun calibration: aim at the top-left corner and pull the trigger"
+            }
+            CalibrationEvent::TopLeftTaken => {
+                "Now aim at the bottom-right corner and pull the trigger"
+            }
+            CalibrationEvent::OffScreen => "Off screen: aim at the corner and pull again",
+            CalibrationEvent::Failed => "Corners too close: calibration not changed",
+            CalibrationEvent::Cancelled => "Gun calibration cancelled",
+            CalibrationEvent::Finished(calibration) => {
+                log::info!("Light gun: calibrated {:?}", calibration);
+                if let Some(key) = self.light_gun.target().and_then(calibration_key) {
+                    key.set(&calibration.to_words());
+                    key.flush();
+                }
+                "Gun calibrated"
+            }
+        };
+        ui::send(ui::Message::Notification(ui::Notification::new_long(
+            text.to_string(),
+        )));
+    }
+}
+
+/// Where a core's light gun calibration is kept.
+fn calibration_key(target: lightgun::Target) -> Option<&'static KvsKey<[i32; 4]>> {
+    (target == lightgun::TARGET_3DO).then_some(&crate::kvs::keys::GUN_CAL_3DO)
 }

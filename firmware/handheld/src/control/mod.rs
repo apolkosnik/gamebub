@@ -118,8 +118,10 @@ pub fn handle_control_out(request: &Request, buf: &[u8]) -> Result<(), ()> {
             }
             let slot = u32::from_le_bytes(buf[0..4].try_into().unwrap());
             // (A B X Y) (Up Down Right Left) (System Select Start Capture(?)) (L1 R1 L2 R2 L3 R3)
+            // A light gun has bit 31 set (see the `lightgun` crate).
             let data = &buf[4..20];
             let data = InputState {
+                raw_buttons: u32::from_le_bytes(data[0..4].try_into().unwrap()),
                 btn_a: (data[0] & 0x1) != 0,
                 btn_b: (data[0] & 0x2) != 0,
                 btn_x: (data[0] & 0x4) != 0,

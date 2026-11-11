@@ -1,0 +1,9 @@
+[package]
+name = "lightgun"
+version = "0.1.0"
+authors = ["Adam Polkosnik <apolkosnik@gmail.com>"]
+edition = "2021"
+description = "Light gun (GunCon 3 through the dock) logic for the Game Bub handheld: aim calibration and core register values. No dependencies, so it is tested on the host: cargo test"
+license = "GPL-3.0-only"
+
+[dependencies]
