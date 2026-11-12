@@ -18,9 +18,11 @@
 //!    (`MouseReport`). Every report is one movement, counted exactly once
 //!    (`Mouse::report`), summed across the reports since the previous
 //!    packet (`Motion`) and scaled by `SENSITIVITY_NUMERATOR` /
-//!    `SENSITIVITY_DENOMINATOR` (1/2: the core doubles, so one count of the
-//!    mouse is one count of the 3DO mouse), the fraction of a unit carried
-//!    to the next packet. While a mouse is on the dock the stick does
+//!    `SENSITIVITY_DENOMINATOR` (1: one count of the mouse is one count of
+//!    the 3DO mouse), any fraction of a unit carried to the next packet.
+//!    Every report is written to the core as it arrives: paced, a 125 Hz
+//!    mouse's 8 ms reports fell into the 3DO's 16.7 ms fields one or three
+//!    at a time, and the cursor stuttered. While a mouse is on the dock the stick does
 //!    nothing; when it goes the stick goes on, from where it is then. Two
 //!    mice at once are one: their movements add up, a button is held while
 //!    either holds it (`MouseReport::merged`).
@@ -35,10 +37,11 @@
 //!
 //!  * `Target::motion`: `{dy[31:16], dx[15:0]}`, two signed 16-bit units
 //!    moved since the previous write (x right, y down), see `pack_motion`.
-//!    Each write is one movement packet (the core moves the 3DO mouse 2
-//!    counts per unit and clamps a packet to +-255 per axis), so packets are
-//!    small and frequent: written only when there is movement, at most
-//!    every `MIN_MOTION_INTERVAL_MS`, clamped to `MAX_PACKET` per axis (a
+//!    Each write is one movement packet (the core moves the 3DO mouse one
+//!    count per unit and clamps a packet to +-255 per axis), so packets are
+//!    small and frequent: written only when there is movement, the physical
+//!    mouse's with every report, the stick's at most every
+//!    `MIN_MOTION_INTERVAL_MS`, clamped to `MAX_PACKET` per axis (a
 //!    physical mouse's excess waits for the next packet; the stick's is
 //!    dropped);
 //!  * `Target::buttons`: bit 0 left, bit 1 right, bit 2 middle (held = 1),
@@ -125,12 +128,13 @@ impl MouseReport {
 
 /// A physical mouse's sensitivity: the units written to the core per count
 /// of the mouse, as the fraction `SENSITIVITY_NUMERATOR` /
-/// `SENSITIVITY_DENOMINATOR`. 1/2: the core moves the 3DO mouse 2 counts
-/// per unit, so one count of the mouse moves the 3DO mouse one count. The
-/// fraction of a unit left over after a packet is carried to the next, so
-/// nothing is lost: a mouse moved one count at a time still moves.
+/// `SENSITIVITY_DENOMINATOR`. 1: the core moves the 3DO mouse one count per
+/// unit, so one count of the mouse moves the 3DO mouse one count. (It was
+/// 1/2 while the core doubled, as MiSTer's does for raw PS/2 deltas: the
+/// cursor moved in steps of two.) Any fraction of a unit left over after a
+/// packet is carried to the next, so nothing is lost.
 pub const SENSITIVITY_NUMERATOR: i64 = 1;
-pub const SENSITIVITY_DENOMINATOR: i64 = 2;
+pub const SENSITIVITY_DENOMINATOR: i64 = 1;
 
 /// A physical mouse's movement: the reports since the previous packet
 /// summed, in `SENSITIVITY_DENOMINATOR`ths of a unit, with what a packet
@@ -228,13 +232,17 @@ pub const DEAD_ZONE: i32 = 8192;
 pub const SPAN: i32 = i16::MAX as i32 - DEAD_ZONE;
 
 /// The mouse's speed at full deflection, in units written to the core per
-/// second (the core moves the 3DO mouse 2 counts per unit). The speed is
+/// second (the core moves the 3DO mouse one count per unit). The speed is
 /// linear in the deflection past the dead zone: half way out of it moves
 /// half as fast.
 pub const MAX_SPEED: i32 = 300;
 
-/// Least time between two movement packets (about 120 Hz, as the gun's
-/// aim): the core takes a packet at a time.
+/// Least time between two of the stick cursor's movement packets (about
+/// 120 Hz, as the gun's aim). A physical mouse's reports are not paced: a
+/// report is written as it arrives (the core takes a packet at a time, at
+/// any rate). Paced to this interval with a millisecond clock, a 125 Hz
+/// mouse's 8 ms reports were held back now and then and fell into the 3DO's
+/// 16.7 ms fields one or three at a time: the cursor stuttered.
 pub const MIN_MOTION_INTERVAL_MS: u64 = 8;
 
 /// The most time one update of the cursor integrates: a long gap between
@@ -470,9 +478,9 @@ impl Mouse {
     /// Controller register at 1); the mouse then stands still, its buttons
     /// released, as it does while the setting is not `CONTROLLER_MOUSE`.
     ///
-    /// A movement packet is written when there are whole units to move
-    /// (the physical mouse's reports since the previous packet, or the
-    /// stick's integral), at most every `MIN_MOTION_INTERVAL_MS`; a button
+    /// A movement packet is written when there are whole units to move:
+    /// the physical mouse's reports since the previous update at once, the
+    /// stick's integral at most every `MIN_MOTION_INTERVAL_MS`; a button
     /// change at once.
     pub fn update(&mut self, now_ms: u64, gun_connected: bool, input: &MouseInput) -> Writes {
         let mut writes = Writes::default();
@@ -501,9 +509,12 @@ impl Mouse {
             self.motion.reset();
             self.cursor.update(now_ms, input.stick_x, input.stick_y);
         }
-        let due = self
-            .last_motion_write
-            .is_none_or(|at| now_ms.saturating_sub(at) >= MIN_MOTION_INTERVAL_MS);
+        // The mouse's reports go out as they come (the firmware updates on
+        // every report); the stick's cursor is paced.
+        let due = physical
+            || self
+                .last_motion_write
+                .is_none_or(|at| now_ms.saturating_sub(at) >= MIN_MOTION_INTERVAL_MS);
         if due {
             let (dx, dy) = if physical {
                 self.motion.take()
@@ -746,88 +757,73 @@ mod tests {
     }
 
     #[test]
-    fn sensitivity_is_a_half() {
-        // One count of the mouse is half a unit: one count of the 3DO
-        // mouse, since the core doubles.
-        assert_eq!((SENSITIVITY_NUMERATOR, SENSITIVITY_DENOMINATOR), (1, 2));
+    fn sensitivity_is_one() {
+        // One count of the mouse is one unit: one count of the 3DO mouse.
+        assert_eq!((SENSITIVITY_NUMERATOR, SENSITIVITY_DENOMINATOR), (1, 1));
         let mut m = Motion::new();
-        m.add(2, -2);
+        m.add(1, -1);
         assert_eq!(m.take(), (1, -1));
-        m.add(100, -300);
-        assert_eq!(m.take(), (50, -150));
+        m.add(100, -200);
+        assert_eq!(m.take(), (100, -200));
         assert!(!m.pending());
     }
 
     #[test]
-    fn motion_sums_reports_and_carries_the_fraction() {
+    fn motion_sums_reports_and_loses_none() {
         let mut m = Motion::new();
         assert!(!m.pending());
         assert_eq!(m.take(), (0, 0));
         // The reports between two packets add up: 3 + 4 + 2 = 9 counts
-        // right, 1 + 1 + 1 = 3 down...
+        // right, 1 + 1 + 1 = 3 down.
         m.add(3, 1);
         m.add(4, 1);
         m.add(2, 1);
         assert!(m.pending());
-        // ...4.5 and 1.5 units: 4 and 1, half a unit carried on each.
-        assert_eq!(m.take(), (4, 1));
-        assert!(m.pending(), "the halves are kept");
-        assert_eq!(m.take(), (0, 0), "but a half is not a packet");
-        // Another count each completes them.
-        m.add(1, 1);
-        assert_eq!(m.take(), (1, 1));
-        assert!(!m.pending());
-        // One count at a time, both ways: every other take moves, none is
-        // lost.
+        assert_eq!(m.take(), (9, 3));
+        assert!(!m.pending(), "a count is a whole unit: nothing carried");
+        assert_eq!(m.take(), (0, 0));
+        // One count at a time, both ways: every take moves, none is lost.
         let mut steps = Vec::new();
         for _ in 0..10 {
             m.add(1, -1);
             steps.push(m.take());
         }
-        assert_eq!(steps, [(0, 0), (1, -1)].repeat(5));
-        // Toward zero, the carry with the movement's sign.
+        assert_eq!(steps, [(1, -1)].repeat(10));
+        // Toward zero too.
         m.add(-3, 3);
-        assert_eq!(m.take(), (-1, 1));
-        m.add(-1, 1);
-        assert_eq!(m.take(), (-1, 1));
+        assert_eq!(m.take(), (-3, 3));
         assert!(!m.pending());
-        // A report back cancels the carry.
+        // A report back cancels.
         m.add(1, 0);
         m.add(-1, 0);
         assert_eq!(m.take(), (0, 0));
         assert!(!m.pending());
-        // Reset forgets the carry.
+        // Reset forgets what was not taken.
         m.add(1, 1);
         m.reset();
         assert!(!m.pending());
-        m.add(1, 1);
         assert_eq!(m.take(), (0, 0));
     }
 
     #[test]
     fn motion_is_clamped_and_the_excess_carried() {
         let mut m = Motion::new();
-        // A jerk of 1000 counts right and 700 up: 500 and -350 units.
+        // A jerk of 1000 counts right and 700 up: 255 a packet.
         m.add(1000, -700);
         assert_eq!(m.take(), (255, -255));
         assert!(m.pending());
-        assert_eq!(
-            m.take(),
-            (245, -95),
-            "the rest in the next packet, nothing lost"
-        );
+        assert_eq!(m.take(), (255, -255), "the rest in the next packets");
+        assert_eq!(m.take(), (255, -190));
+        assert_eq!(m.take(), (235, 0), "nothing lost");
         assert_eq!(m.take(), (0, 0));
         assert!(!m.pending());
         // The biggest reports there are, many of them: taken 255 at a
-        // time, the sum conserved to the half unit.
+        // time, the sum conserved.
         let n = 101;
         for _ in 0..n {
             m.add(i16::MAX, i16::MIN);
         }
-        let expected = (
-            n as i64 * i16::MAX as i64 / 2,
-            n as i64 * i16::MIN as i64 / 2,
-        );
+        let expected = (n as i64 * i16::MAX as i64, n as i64 * i16::MIN as i64);
         let mut total = (0i64, 0i64);
         let mut packets = 0;
         loop {
@@ -842,11 +838,7 @@ mod tests {
         }
         assert_eq!(total, expected);
         assert_eq!(packets, (expected.1.abs() + 254) / 255);
-        assert_eq!(
-            m,
-            Motion { x: 1, y: 0 },
-            "101 * 32767 counts is odd: half a unit left"
-        );
+        assert_eq!(m, Motion { x: 0, y: 0 }, "nothing left: a count is a unit");
     }
 
     #[test]
@@ -855,69 +847,77 @@ mod tests {
         m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
         // Taken with a mouse on the dock: the buttons are written (released).
         assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
-        // The first report after a while: written at once.
+        // A report: written at once, count for count.
         m.report(&moved(3, 0));
         assert_eq!(
             writes(&m.update(1, false, &physical(0))),
-            [(0x1030, pack_motion(1, 0))]
+            [(0x1030, pack_motion(3, 0))]
         );
-        // The reports in the next 8 ms are summed, not written yet: with
-        // the half carried, 1 + 3 + 2 = 6 half units right, 5 up.
+        // The next ones too, however soon: a report is not held back for an
+        // interval (held back, a 125 Hz mouse's reports fell into the 3DO's
+        // fields one or three at a time).
         m.report(&moved(3, 0));
-        assert!(m.update(3, false, &physical(0)).is_empty());
-        m.report(&moved(2, -5));
-        assert!(m.update(5, false, &physical(0)).is_empty());
-        // The tick 7 ms after the packet: not due.
-        assert!(m.update(8, false, &physical(0)).is_empty());
-        // Due: 3 units right, -2.5 so -2 up, the half carried.
         assert_eq!(
-            writes(&m.update(9, false, &physical(0))),
-            [(0x1030, pack_motion(3, -2))]
+            writes(&m.update(3, false, &physical(0))),
+            [(0x1030, pack_motion(3, 0))]
         );
-        // Nothing new: the ticks write nothing (half a unit is not a
-        // packet).
-        assert!(m.update(17, false, &physical(0)).is_empty());
-        assert!(m.update(25, false, &physical(0)).is_empty());
+        m.report(&moved(2, -5));
+        assert_eq!(
+            writes(&m.update(5, false, &physical(0))),
+            [(0x1030, pack_motion(2, -5))]
+        );
+        for t in 6..=30u64 {
+            m.report(&moved(1, 1));
+            assert_eq!(
+                writes(&m.update(t, false, &physical(0))),
+                [(0x1030, pack_motion(1, 1))],
+                "at {t}"
+            );
+        }
+        // Reports that came between two updates add up into one packet.
+        m.report(&moved(1, 0));
+        m.report(&moved(2, -1));
+        assert_eq!(
+            writes(&m.update(31, false, &physical(0))),
+            [(0x1030, pack_motion(3, -1))]
+        );
+        // Nothing new: the ticks write nothing.
+        assert!(m.update(39, false, &physical(0)).is_empty());
+        assert!(m.update(47, false, &physical(0)).is_empty());
         // The latest report's movement is not counted by an update, however
         // many: it was counted when it arrived.
         let same = MouseInput {
             mouse: Some(moved(100, 100)),
             ..MouseInput::default()
         };
-        assert!(m.update(33, false, &same).is_empty());
-        assert!(m.update(41, false, &same).is_empty());
-        // Another count up completes the carried half: at once, due since 9.
-        m.report(&moved(0, -1));
-        assert_eq!(
-            writes(&m.update(42, false, &physical(0))),
-            [(0x1030, pack_motion(0, -1))]
-        );
+        assert!(m.update(55, false, &same).is_empty());
+        assert!(m.update(63, false, &same).is_empty());
         // Left pressed, no movement: the button at once, alone.
         m.report(&dock_mouse(button::LEFT));
         assert_eq!(
-            writes(&m.update(43, false, &physical(button::LEFT))),
+            writes(&m.update(64, false, &physical(button::LEFT))),
             [(0x1034, 0b001)]
         );
         // Held: nothing.
         m.report(&dock_mouse(button::LEFT));
-        assert!(m.update(44, false, &physical(button::LEFT)).is_empty());
-        // Moved as it is released and the middle one pressed, 8 ms on:
-        // motion first, then the buttons.
+        assert!(m.update(65, false, &physical(button::LEFT)).is_empty());
+        // Moved as it is released and the middle one pressed: motion, then
+        // the buttons.
         m.report(&MouseReport {
             dx: -2,
             dy: 4,
             ..dock_mouse(button::MIDDLE)
         });
         assert_eq!(
-            writes(&m.update(51, false, &physical(button::MIDDLE))),
-            [(0x1030, pack_motion(-1, 2)), (0x1034, 0b100)]
+            writes(&m.update(66, false, &physical(button::MIDDLE))),
+            [(0x1030, pack_motion(-2, 4)), (0x1034, 0b100)]
         );
         // All three, and the handheld's R too: one right button.
         let all = MouseInput {
             handheld_r: true,
             ..physical(button::LEFT | button::RIGHT | button::MIDDLE)
         };
-        assert_eq!(writes(&m.update(52, false, &all)), [(0x1034, 0b111)]);
+        assert_eq!(writes(&m.update(67, false, &all)), [(0x1034, 0b111)]);
         // Back, forward and the wheel do nothing.
         let other = button::BACK | button::FORWARD;
         m.report(&MouseReport {
@@ -925,10 +925,10 @@ mod tests {
             ..dock_mouse(other)
         });
         assert_eq!(
-            writes(&m.update(60, false, &physical(other))),
+            writes(&m.update(75, false, &physical(other))),
             [(0x1034, 0)]
         );
-        assert!(m.update(68, false, &physical(other)).is_empty());
+        assert!(m.update(83, false, &physical(other)).is_empty());
     }
 
     #[test]
@@ -937,25 +937,33 @@ mod tests {
         m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
         m.update(0, false, &physical(0));
         // 300 reports of 4 counts right and 1 up before the next update
-        // (a fast mouse, a fast hand): 600 units right, 150 up. The packet
-        // is clamped; the rest waits for the next ones, 8 ms apart.
+        // (a fast mouse, a fast hand): 1200 counts right, 300 up. The packet
+        // is clamped; the rest follows with the next updates (the next
+        // reports, or the ticks), nothing lost.
         for _ in 0..300 {
             m.report(&moved(4, -1));
         }
         assert_eq!(
             writes(&m.update(1, false, &physical(0))),
-            [(0x1030, pack_motion(255, -150))]
+            [(0x1030, pack_motion(255, -255))]
         );
-        assert!(m.update(5, false, &physical(0)).is_empty(), "not due");
         assert_eq!(
-            writes(&m.update(9, false, &physical(0))),
+            writes(&m.update(2, false, &physical(0))),
+            [(0x1030, pack_motion(255, -45))]
+        );
+        assert_eq!(
+            writes(&m.update(3, false, &physical(0))),
             [(0x1030, pack_motion(255, 0))]
         );
         assert_eq!(
-            writes(&m.update(17, false, &physical(0))),
-            [(0x1030, pack_motion(90, 0))]
+            writes(&m.update(4, false, &physical(0))),
+            [(0x1030, pack_motion(255, 0))]
         );
-        assert!(m.update(25, false, &physical(0)).is_empty());
+        assert_eq!(
+            writes(&m.update(12, false, &physical(0))),
+            [(0x1030, pack_motion(180, 0))]
+        );
+        assert!(m.update(20, false, &physical(0)).is_empty());
     }
 
     #[test]
@@ -992,11 +1000,11 @@ mod tests {
             writes(&m.update(901, false, &both_left_r)),
             [(0x1034, 0b011)]
         );
-        // The mouse's movement does (11 counts: 5 units, a half carried).
+        // The mouse's movement does (11 counts: 11 units).
         m.report(&moved(11, 0));
         assert_eq!(
             writes(&m.update(910, false, &both_left_r)),
-            [(0x1030, pack_motion(5, 0))]
+            [(0x1030, pack_motion(11, 0))]
         );
         // The mouse goes (unplugged), the stick still full with the pad's
         // buttons held: those are the mouse's now...
@@ -1016,12 +1024,11 @@ mod tests {
             [(0x1030, pack_motion(2, 2))]
         );
         // The mouse back: the stick stops at once and the pad's buttons go
-        // (the mouse's are released); the mouse starts afresh, the half it
-        // had carried gone with it (1 count right: a half again, not one).
+        // (the mouse's are released); the mouse's report is written.
         m.report(&moved(1, 2));
         assert_eq!(
             writes(&m.update(936, false, &both)),
-            [(0x1030, pack_motion(0, 1)), (0x1034, 0)]
+            [(0x1030, pack_motion(1, 2)), (0x1034, 0)]
         );
         assert!(m.update(944, false, &both).is_empty());
         assert!(m.update(1000, false, &both).is_empty());
@@ -1048,7 +1055,7 @@ mod tests {
         m.report(&moved(6, 6));
         assert_eq!(
             writes(&m.update(8, false, &physical(button::LEFT))),
-            [(0x1030, pack_motion(3, 3))]
+            [(0x1030, pack_motion(6, 6))]
         );
         // A gun is plugged in: the button is released; the mouse's reports
         // go nowhere.
@@ -1071,7 +1078,7 @@ mod tests {
         m.report(&moved(-2, 0));
         assert_eq!(
             writes(&m.update(1016, false, &physical(button::LEFT))),
-            [(0x1030, pack_motion(-1, 0))]
+            [(0x1030, pack_motion(-2, 0))]
         );
     }
 
@@ -1098,7 +1105,7 @@ mod tests {
         assert!(m.motion.pending());
         assert_eq!(
             writes(&m.update(36, false, &physical(0))),
-            [(0x1030, pack_motion(1, 1))]
+            [(0x1030, pack_motion(2, 2))]
         );
         // The core lost the focus: dropped again.
         m.set_target(None, CONTROLLER_MOUSE);
@@ -1178,7 +1185,7 @@ mod tests {
         m.report(&moved(0, 2));
         assert_eq!(
             writes(&m.update(8, false, &both(moved(2, 0), moved(0, 2)))),
-            [(0x1030, pack_motion(1, 1))]
+            [(0x1030, pack_motion(2, 2))]
         );
         // The second mouse presses left.
         assert_eq!(
