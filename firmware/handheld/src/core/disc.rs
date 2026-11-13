@@ -1,7 +1,8 @@
 //! CD images for cores with a disc drive: a `.cue` sheet with its `.bin`
 //! files, or a lone `.bin`, of raw 2352-byte sectors; or a 2048-byte-sector
 //! image (an `.iso`, or a cue sheet's `MODE1/2048` track), whose raw sectors
-//! are made up as a pressed disc has them (see [`mode1_frame`]).
+//! are made up as a pressed disc has them (see [`mode1_frame`]); or a CHD
+//! (see [`super::chd`]).
 //!
 //! A file marked `disc` in the core's `files.json` is not transferred: its
 //! table of contents goes to the file's address (see [`DiscImage::toc`]),
@@ -29,7 +30,12 @@ use std::{
     time::Instant,
 };
 
+use super::chd::Chd;
+
 pub const SECTOR_SIZE: usize = 2352;
+/// The scratch space [`DiscImage::read_sector`] needs for a CHD: two of its
+/// largest hunks and the decoders' tables.
+pub const WORK_SIZE: usize = super::chd::WORK_SIZE;
 /// The user data of a MODE1 sector: what a 2048-byte-sector image holds.
 const COOKED_SIZE: usize = 2048;
 /// The sync pattern that starts every raw data sector.
@@ -49,6 +55,9 @@ struct Track {
     index1: u32,
     /// The track's first sector that is in a file, which file and which sector there.
     data_start: u32,
+    /// The track's last sector in the file, if the track goes on after it
+    /// (a CHD track's postgap); otherwise the file has all up to `end`.
+    data_end: Option<u32>,
     file: usize,
     file_sector: u64,
 }
@@ -60,7 +69,10 @@ struct ImageFile {
 }
 
 pub struct DiscImage {
+    /// For a CHD, one per track (whose sectors are the CHD's frames from the
+    /// track's `file_sector` on), all with the CHD's path.
     files: Vec<ImageFile>,
+    chd: Option<Chd>,
     /// The first file, and one other (by index), once opened.
     first: Option<File>,
     other: Option<(usize, File)>,
@@ -150,6 +162,11 @@ fn mode1_frame(lba: u32, sector: &mut [u8; SECTOR_SIZE]) {
         .fold(0u32, |e, &b| (e >> 8) ^ EDC[((e ^ b as u32) & 0xff) as usize]);
     sector[2064..2068].copy_from_slice(&edc.to_le_bytes());
     sector[2068..2076].fill(0);
+    ecc_generate(sector);
+}
+
+/// The P and Q ECC of a sector (over its header and data, 12..2076).
+pub(super) fn ecc_generate(sector: &mut [u8; SECTOR_SIZE]) {
     let mut p = [0u8; 172];
     ecc_block(&sector[12..], 86, 24, 2, 86, &mut p);
     sector[2076..2248].copy_from_slice(&p);
@@ -224,6 +241,7 @@ fn finish_track(
         end: 0, // set by the next track, or the lead-out
         index1: file_base + *shift + index1,
         data_start,
+        data_end: None,
         file: files.len() - 1,
         file_sector: first_in_file as u64,
     };
@@ -248,6 +266,8 @@ impl DiscImage {
         let extension_is = |ext: &str| path.extension().map_or(false, |e| e.eq_ignore_ascii_case(ext));
         if extension_is("cue") {
             Self::open_cue(path)
+        } else if extension_is("chd") {
+            Self::open_chd(path)
         } else {
             let size = Self::size(path)?;
             let raw = extension_is("bin") || Self::starts_with_sync(path)?;
@@ -266,11 +286,13 @@ impl DiscImage {
                 end: FIRST_LBA + sectors - 1,
                 index1: FIRST_LBA,
                 data_start: FIRST_LBA,
+                data_end: None,
                 file: 0,
                 file_sector: 0,
             };
             Ok(DiscImage {
                 files: vec![ImageFile { path: path.to_path_buf(), cooked }],
+                chd: None,
                 first: None,
                 other: None,
                 tracks: vec![track],
@@ -435,7 +457,39 @@ impl DiscImage {
         }
         last.end = lead_out - 1;
 
-        Ok(DiscImage { files, first: None, other: None, tracks, lead_out })
+        Ok(DiscImage { files, chd: None, first: None, other: None, tracks, lead_out })
+    }
+
+    /// Open a CHD. As in MAME (`cdrom_file`), a track's pregap is either in
+    /// the CHD before its index 1 (`PGTYPE:V...`, from a cue sheet's
+    /// `INDEX 00`) or silence that is in no file, and its postgap is silence
+    /// after it. Track 1 starts at 150 like the other formats.
+    fn open_chd(path: &Path) -> Result<Self, String> {
+        let chd = Chd::open(path)?;
+        let mut files = Vec::new();
+        let mut tracks = Vec::new();
+        let mut lba = FIRST_LBA;
+        for t in &chd.tracks {
+            let start = lba;
+            let index1 = start + t.pregap;
+            let data_start = if t.pregap_in_data { start } else { index1 };
+            let data_end = data_start + t.frames - 1;
+            let end = data_end + t.postgap;
+            files.push(ImageFile { path: path.to_path_buf(), cooked: t.cooked });
+            tracks.push(Track {
+                number: t.number,
+                audio: t.audio,
+                start,
+                end,
+                index1,
+                data_start,
+                data_end: Some(data_end),
+                file: files.len() - 1,
+                file_sector: t.chd_frame as u64,
+            });
+            lba = end + 1;
+        }
+        Ok(DiscImage { files, chd: Some(chd), first: None, other: None, tracks, lead_out: lba })
     }
 
     pub fn log(&self) {
@@ -487,16 +541,31 @@ impl DiscImage {
     }
 
     /// Read the sector at absolute LBA `lba` (raw: from a 2048-byte-sector
-    /// file, made up around its user data).
-    pub fn read_sector(&mut self, lba: u32, buffer: &mut [u8; SECTOR_SIZE]) -> std::io::Result<()> {
+    /// file, made up around its user data). `work` is scratch space for a
+    /// CHD's hunks (see [`WORK_SIZE`]).
+    pub fn read_sector(&mut self, lba: u32, buffer: &mut [u8; SECTOR_SIZE], work: &mut [u8]) -> std::io::Result<()> {
         let track = self.tracks.iter().find(|t| lba >= t.start && lba <= t.end);
-        let Some(track) = track.filter(|t| lba >= t.data_start) else {
+        let Some(track) = track.filter(|t| lba >= t.data_start && t.data_end.map_or(true, |end| lba <= end)) else {
             buffer.fill(0);
             return Ok(());
         };
         let sector = track.file_sector + (lba - track.data_start) as u64;
         let index = track.file;
         let cooked = self.files[index].cooked;
+        if let Some(chd) = &mut self.chd {
+            chd.read_frame(sector as u32, buffer, work)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if cooked {
+                buffer.copy_within(0..COOKED_SIZE, 16);
+                mode1_frame(lba, buffer);
+            } else if track.audio {
+                // CHDs keep CD-DA samples big-endian.
+                for pair in buffer.chunks_exact_mut(2) {
+                    pair.swap(0, 1);
+                }
+            }
+            return Ok(());
+        }
         let file = self.file(index)?;
         if cooked {
             file.seek(SeekFrom::Start(sector * COOKED_SIZE as u64))?;

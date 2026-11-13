@@ -23,6 +23,8 @@ use crate::{
 pub use info::*;
 use settings::CoreSettings;
 
+mod chd;
+mod chd_codec;
 mod disc;
 mod info;
 mod settings;
@@ -937,6 +939,9 @@ impl CoreManager {
         let _ = device.fpga.write_u32(fpga::REG_CTRL_CMD_CORE, 0);
     }
 
+    // The scratch buffer holds a sector, its read-back and a CHD's work space.
+    const _SCRATCH_FITS: () = assert!(2 * disc::SECTOR_SIZE + disc::WORK_SIZE <= 64 * 1024);
+
     /// `DISC_READ`: a sector of a disc into the core's memory, at the
     /// file's transfer speed, read back and compared if it has `verify` set
     /// (written again, up to three times, when it does not match).
@@ -957,15 +962,16 @@ impl CoreManager {
             return false;
         };
         // The scratch buffer (internal RAM, free while the core runs): the
-        // sector, then its read-back.
+        // sector, its read-back, then a CHD's work space.
         let Some(mut scratch) = crate::bitstream::SCRATCH.take() else {
             log::warn!("Disc read: scratch buffer busy");
             return false;
         };
-        let (sector, readback) = scratch.deref_mut().split_at_mut(disc::SECTOR_SIZE);
+        let (sector, rest) = scratch.deref_mut().split_at_mut(disc::SECTOR_SIZE);
         let sector: &mut [u8; disc::SECTOR_SIZE] = sector.try_into().unwrap();
-        let readback = &mut readback[..disc::SECTOR_SIZE];
-        if let Err(e) = image.read_sector(lba, sector) {
+        let (readback, work) = rest.split_at_mut(disc::SECTOR_SIZE);
+        let work = &mut work[..disc::WORK_SIZE];
+        if let Err(e) = image.read_sector(lba, sector, work) {
             log::error!("Disc read at {lba}: {e}");
             return false;
         }

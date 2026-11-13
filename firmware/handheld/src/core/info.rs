@@ -83,7 +83,7 @@ pub struct CoreFile {
     #[serde(default)]
     pub verify: bool,
     /// If true, the file is a CD image (a `.cue` sheet with its `.bin` files,
-    /// or a raw `.bin`): its table of contents goes to `address` instead of
+    /// a raw `.bin`, an `.iso` or a `.chd`): its table of contents goes to `address` instead of
     /// the file, and the core reads sectors by request (see `core::disc`).
     #[serde(default)]
     pub disc: bool,
