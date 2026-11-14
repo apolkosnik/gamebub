@@ -9,8 +9,6 @@ component ListBox {
     in property <[string]> choices;
     in property <bool> focused;
 
-    private property <length> item-height: i-area.viewport-height / choices.length;
-
     callback on-changed();
 
     HorizontalLayout {
@@ -22,19 +20,14 @@ component ListBox {
             colorize: #000;
         }
 
-        i-area := Flickable {
-            viewport-y: -root.item-height * root.index;
-            viewport-height: i-items.min-height;
-            height: item-height;
-            width: i-items.min-width;
-
-            i-items := VerticalLayout {
-                width: self.min-width;
-                for choice[i] in root.choices: child-items := Text {
-                    text: choice;
-                    horizontal-alignment: right;
-                }
-            }
+        // Only the choice selected is an item. (A Flickable over a column of
+        // all the choices, scrolled to the one selected, cost about 4 KB of
+        // heap per list setting on screen and 225 bytes per choice: a core
+        // with 16 settings and 75 choices took 85 KB for this screen, and
+        // the firmware ran out of memory drawing it.)
+        Text {
+            text: root.choices[root.index];
+            horizontal-alignment: right;
         }
 
         Image {
