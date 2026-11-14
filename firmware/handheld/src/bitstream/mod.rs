@@ -17,7 +17,13 @@ pub mod gba;
 
 mod util;
 
-pub static SCRATCH: ScratchBuffer<{ 16 * 1024 }> = ScratchBuffer::new();
+/// File transfers go through this buffer. 64 KiB: an on-demand disc read
+/// (`core/files_disc.rs`) needs a sector and a CHD's work space in it, and
+/// large SD commands are faster (FatFs reads or writes at most one cluster
+/// per command, and the card spends about 1.4 ms on each).
+pub static SCRATCH: ScratchBuffer<{ 64 * 1024 }> = ScratchBuffer::new();
+/// The size of [`SCRATCH`].
+pub const SCRATCH_SIZE: usize = 64 * 1024;
 
 /// Driver for a specific bitstream.
 pub trait Bitstream {
