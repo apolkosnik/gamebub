@@ -33,6 +33,26 @@ pub unsafe extern "C" fn __wrap_esp_panic_handler(info: *mut core::ffi::c_void) 
     report.magic = MAGIC_NUMBER;
     report.crash = true;
 
+    // Which task it was and how much heap was left: a stack overflow or an
+    // allocation failure has no panic message of its own. (Only calls that
+    // take no lock: the heap's may be held by the task that crashed.)
+    {
+        let name = esp_idf_svc::sys::pcTaskGetName(core::ptr::null_mut());
+        let name = if name.is_null() {
+            "?"
+        } else {
+            core::ffi::CStr::from_ptr(name).to_str().unwrap_or("?")
+        };
+        let _ = writeln!(
+            report.message,
+            "CRASH in task '{}': free heap {} bytes, least ever {} bytes, this task's least free stack {} bytes",
+            name,
+            esp_idf_svc::sys::esp_get_free_heap_size(),
+            esp_idf_svc::sys::esp_get_minimum_free_heap_size(),
+            esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()),
+        );
+    }
+
     let mut pc: u32 = 0;
     let mut sp: u32 = 0;
     let mut next_pc: u32 = 0;
