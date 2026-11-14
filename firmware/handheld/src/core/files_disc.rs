@@ -22,9 +22,9 @@ use super::{command, disc, CoreManager};
 /// The absolute LBA of the image's first sector.
 const FIRST_LBA: u64 = 150;
 
-// A disc read takes the scratch buffer for a sector and a CHD's work space.
-const _: () =
-    assert!(disc::SECTOR_SIZE + disc::WORK_SIZE <= crate::bitstream::SCRATCH_SIZE);
+// A disc read takes the scratch buffer for a sector (a CHD's work space is
+// the image's own).
+const _: () = assert!(disc::SECTOR_SIZE <= crate::bitstream::SCRATCH_SIZE);
 
 impl CoreManager {
     /// Whether the core's file `file_id` is an on-demand disc.
@@ -48,6 +48,9 @@ impl CoreManager {
         };
         let image = disc::DiscImage::open(path).map_err(|e| {
             log::error!("Disc {}: {e}", path.display());
+            crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(
+                "Cannot open the disc image".to_string(),
+            )));
             command::FILE_STATUS_ERR_IO
         })?;
         image.log();
@@ -98,15 +101,14 @@ impl CoreManager {
         let size = (image.lead_out() as u64).saturating_sub(FIRST_LBA) * disc::SECTOR_SIZE as u64;
         let end = (offset + length as u64).min(size);
 
-        // The scratch buffer (internal RAM): a sector, then a CHD's work space.
+        // The scratch buffer (internal RAM): a sector.
         let Some(mut scratch) = crate::bitstream::SCRATCH.take() else {
             log::warn!("Disc read: scratch buffer busy");
             result[0] = command::FILE_STATUS_ERR_IO;
             return false;
         };
-        let (sector, rest) = scratch.deref_mut().split_at_mut(disc::SECTOR_SIZE);
-        let sector: &mut [u8; disc::SECTOR_SIZE] = sector.try_into().unwrap();
-        let work = &mut rest[..disc::WORK_SIZE];
+        let sector: &mut [u8; disc::SECTOR_SIZE] =
+            (&mut scratch.deref_mut()[..disc::SECTOR_SIZE]).try_into().unwrap();
         let command = SpiCommand::new(fpga::FpgaSpiWordSize::Bits32);
 
         let mut pos = offset;
@@ -114,7 +116,7 @@ impl CoreManager {
             let lba = FIRST_LBA + pos / disc::SECTOR_SIZE as u64;
             let within = (pos % disc::SECTOR_SIZE as u64) as usize;
             let n = (disc::SECTOR_SIZE - within).min((end - pos) as usize);
-            if let Err(e) = image.read_sector(lba as u32, sector, work) {
+            if let Err(e) = image.read_sector(lba as u32, sector) {
                 log::error!("Disc read at {lba}: {e}");
                 result[0] = command::FILE_STATUS_ERR_IO;
                 result[1] = (pos - offset) as u32;
