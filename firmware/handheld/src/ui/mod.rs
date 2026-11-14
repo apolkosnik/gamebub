@@ -49,6 +49,10 @@ pub enum Message {
     FatalError(String),
     /// Internal input state changed
     InputState(input::InputState),
+    /// Run (true) or stop the mouse tick: `InputManager::mouse_tick` every
+    /// `lightgun::mouse::MIN_MOTION_INTERVAL_MS`, so a stick held still
+    /// keeps moving the running core's mouse between gamepad reports.
+    MouseTick(bool),
     /// Show a notification
     Notification(Notification),
     /// Docked
@@ -120,6 +124,9 @@ pub struct UI {
     state: Rc<RefCell<UiState>>,
     button_event_detector: buttons::ButtonEventDetector,
     idle_timer: Timer,
+    /// The mouse tick (`Message::MouseTick`), running while a core's mouse
+    /// is driven from a stick.
+    mouse_timer: Timer,
 }
 
 impl UI {
@@ -171,6 +178,7 @@ impl UI {
             root,
             button_event_detector: buttons::ButtonEventDetector::new(),
             idle_timer,
+            mouse_timer: Timer::default(),
         }
     }
 
@@ -276,6 +284,16 @@ impl UI {
                 self.root.invoke_set_screen(slint::ScreenId::Error);
             }
             Message::InputState(state) => InputManager::lock().update_state(state),
+            Message::MouseTick(true) => {
+                if !self.mouse_timer.running() {
+                    self.mouse_timer.start(
+                        TimerMode::Repeated,
+                        Duration::from_millis(lightgun::mouse::MIN_MOTION_INTERVAL_MS),
+                        || crate::input::InputManager::lock().mouse_tick(),
+                    );
+                }
+            }
+            Message::MouseTick(false) => self.mouse_timer.stop(),
             Message::Notification(notification) => {
                 self.state
                     .borrow_mut()

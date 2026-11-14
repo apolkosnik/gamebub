@@ -51,6 +51,9 @@ pub static LAST_CORE: KvsKey<String> = KvsKey::new("last-core");
 /// Whether docked controllers should have A/B and X/Y swapped.
 pub static DOCK_SWAP_ABXY: KvsKey<bool> = KvsKey::new_with_default("dock-swap-abxy", false);
 
+/// The 3DO core's light gun calibration (`lightgun::Calibration::to_words`).
+pub static GUN_CAL_3DO: KvsKey<[i32; 4]> = KvsKey::new("3do-gun-cal");
+
 /// Whether to keep built-in screen on when docked.
 pub static DOCK_USE_BUILTIN_SCREEN: KvsKey<bool> = KvsKey::new_with_default("dock-screen", false);
 
@@ -75,6 +78,7 @@ pub fn flush_all() {
     GBA_BIOS_WARNING.flush();
     LAST_CORE.flush();
     DOCK_SWAP_ABXY.flush();
+    GUN_CAL_3DO.flush();
     DOCK_USE_BUILTIN_SCREEN.flush();
     DEEP_SLEEP.flush();
 }

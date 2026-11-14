@@ -79,6 +79,16 @@ pub struct CoreFile {
     /// If true, the file is not automatically loaded at startup.
     #[serde(default)]
     pub on_demand: bool,
+    /// If true (with `on_demand`), the file is a CD image (`.cue` with its
+    /// `.bin` files, a lone `.bin`, an `.iso` or a `.chd`): the core reads it
+    /// as one raw image of 2352-byte sectors, track 1 at its start, and gets
+    /// its table of contents with `DISC_GET_TOC` (see `disc.rs`).
+    #[serde(default)]
+    pub disc: bool,
+    /// If true, the file is also saved when the core loses focus (the pause
+    /// menu), not only when it exits.
+    #[serde(default)]
+    pub save_on_pause: bool,
 
     /// The address to load the file to.
     #[serde(default)]

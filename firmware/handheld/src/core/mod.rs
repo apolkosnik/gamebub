@@ -20,10 +20,14 @@ use handler::CoreHandlerImpl;
 pub use info::*;
 use settings::CoreSettings;
 
+mod chd;
+mod chd_codec;
 mod command;
+mod disc;
 mod error;
 mod file_selection;
 mod files;
+mod files_disc;
 mod files_on_demand;
 mod handler;
 pub mod info;
@@ -49,6 +53,8 @@ pub struct CoreManager {
     selected_files: Vec<Option<PathBuf>>,
     /// The currently open on-demand file, if any.
     open_on_demand_file: Option<OnDemandFile>,
+    /// The currently open on-demand disc (`disc` file), if any.
+    open_disc: Option<(u16, disc::DiscImage)>,
     run_cartridge: bool,
 }
 
@@ -74,6 +80,7 @@ impl CoreManager {
             core_settings: None,
             selected_files: Vec::new(),
             open_on_demand_file: None,
+            open_disc: None,
             run_cartridge: false,
         }
     }
@@ -180,7 +187,7 @@ impl CoreManager {
 
     pub fn prepare_for_power_off(&mut self) {
         if self.stage == Stage::Running {
-            if let Err(e) = self.persist_files() {
+            if let Err(e) = self.persist_files(|_| true) {
                 log::error!("Error saving: {}", e);
             }
             if let Err(e) = self.persist_settings() {
@@ -194,7 +201,7 @@ impl CoreManager {
         if self.stage == Stage::Running {
             let _ = self.run_core_command(&[command::CORE_HALT], &mut [], NOTIFY_TIMEOUT);
 
-            if let Err(e) = self.persist_files() {
+            if let Err(e) = self.persist_files(|_| true) {
                 log::error!("Error saving: {}", e);
             }
             if let Err(e) = self.persist_settings() {
@@ -221,8 +228,10 @@ impl CoreManager {
         self.stage = Stage::Idle;
         self.selected_files.clear();
         self.open_on_demand_file = None;
+        self.open_disc = None;
 
         InputManager::lock().clear_core_input_caps();
+        InputManager::lock().set_core(None, 0);
 
         let _ = Device::lock()
             .fpga
@@ -258,6 +267,32 @@ impl CoreManager {
             &mut [],
             NOTIFY_TIMEOUT,
         );
+
+        // A dock light gun, or a dock pad's right stick or dock mouse as a
+        // mouse, goes to a core that takes them while it runs with focus;
+        // otherwise a gun is a gamepad (for the menus). Which one, the core's
+        // Controller setting (the register the gun enables) says: its
+        // current value is passed here, so a change in the settings menu
+        // (which takes the focus) is taken when the game goes on.
+        {
+            let core = self
+                .core_info
+                .as_ref()
+                .filter(|_| has_focus && self.stage == Stage::Running);
+            let controller = core
+                .and_then(|core| lightgun::target_for_core(&core.id))
+                .and_then(|target| self.setting_value_at(target.enable))
+                .unwrap_or(0);
+            InputManager::lock().set_core(core.map(|core| core.id.as_str()), controller);
+        }
+
+        // The files marked `save_on_pause` are saved when the core loses
+        // focus (the pause menu), not only when it exits.
+        if !has_focus && self.stage == Stage::Running {
+            if let Err(e) = self.persist_files(|info| info.save_on_pause) {
+                log::error!("Error saving: {}", e);
+            }
+        }
 
         if let Some(core_handler) = self.core_handler.get_mut() {
             core_handler.on_focus_changed(has_focus);

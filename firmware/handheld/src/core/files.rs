@@ -24,6 +24,8 @@ use super::{
 
 /// Only perform background I/O when reading files at least this large.
 const BG_IO_THRESHOLD: usize = 512 * 1024;
+/// Reads of a chunk of a file being saved, in pairs that must agree (see `persist_files`).
+const SAVE_READ_ATTEMPTS: u32 = 4;
 
 impl CoreManager {
     pub(super) fn load_files(&mut self) -> Result<(), CoreError> {
@@ -217,7 +219,12 @@ impl CoreManager {
         Ok(())
     }
 
-    pub(super) fn persist_files(&mut self) -> Result<(), CoreError> {
+    /// Save the core's files that `filter` takes (all of them on exit,
+    /// `save_on_pause` ones when the core loses focus).
+    pub(super) fn persist_files(
+        &mut self,
+        filter: impl Fn(&CoreFile) -> bool,
+    ) -> Result<(), CoreError> {
         assert!(self.stage == Stage::Running);
         let core = self.core_info.as_ref().unwrap();
 
@@ -232,10 +239,11 @@ impl CoreManager {
                 }
             }
             self.open_on_demand_file = None;
+            self.open_disc = None;
         }
 
         for (i, info) in core.files.iter().enumerate() {
-            if info.read_only || info.on_demand {
+            if info.read_only || info.on_demand || !filter(info) {
                 continue;
             }
             if self.run_cartridge && (info.id == 0 || info.dependent_on_0) {
@@ -261,10 +269,25 @@ impl CoreManager {
                 file_size = override_size;
             }
 
-            let mut file = File::create(path)
+            // The file is overwritten in place and cut to size after, so a
+            // save that fails part way (below) leaves the old one whole.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
                 .map_err(|_| FailedSaveFile(info.label.to_string(), "Open failed".to_string()))?;
+            let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
             let mut scratch = crate::bitstream::SCRATCH.take().expect("scratch buffer");
-            let buf = scratch.deref_mut();
+            // Each chunk is read twice (into the two halves of the scratch
+            // buffer) and written only when both reads agree. The FPGA's SPI
+            // cannot wait for the core: a word the core does not have ready in
+            // time is sent as FFFFFFFF and the words after it shift, and the
+            // transfer itself reports nothing. A chunk that never reads the
+            // same twice fails the save before the file is touched.
+            let whole = scratch.deref_mut();
+            let half = whole.len() / 2;
+            let (buf, check) = whole.split_at_mut(half);
             let mut address: u32 = info.address;
             let mut bytes_left = file_size as usize;
 
@@ -272,18 +295,47 @@ impl CoreManager {
             while bytes_left > 0 {
                 let to_read = bytes_left.min(buf.len());
                 let data = &mut buf[0..to_read];
+                let again = &mut check[0..to_read];
 
                 let max_clock =
                     Some(Hertz(info.max_transfer_speed * 1000 * 2).min(MAX_SPI_READ_CLOCK));
                 let command = SpiCommand::new(info.transfer_word_size);
-                let _ = Device::lock()
-                    .fpga
-                    .spi_read(max_clock, command, address, data);
-                file.write(data).map_err(|_| {
+                let read = |into: &mut [u8]| {
+                    Device::lock()
+                        .fpga
+                        .spi_read(max_clock, command, address, into)
+                        .is_ok()
+                };
+                let mut agreed = false;
+                for attempt in 0..SAVE_READ_ATTEMPTS {
+                    if read(data) && read(again) && data == again {
+                        agreed = true;
+                        break;
+                    }
+                    log::warn!(
+                        "Saving {}: bytes {:#x}..{:#x} read differently (attempt {})",
+                        info.label,
+                        address - info.address,
+                        address - info.address + to_read as u32,
+                        attempt + 1
+                    );
+                }
+                if !agreed {
+                    return Err(FailedSaveFile(
+                        info.label.to_string(),
+                        "The core's data did not read back the same".to_string(),
+                    ));
+                }
+                file.write_all(data).map_err(|_| {
                     FailedSaveFile(info.label.to_string(), "Write failed".to_string())
                 })?;
                 address += to_read as u32;
                 bytes_left -= to_read;
+            }
+            if old_size > file_size as u64 {
+                file.set_len(file_size as u64).map_err(|_| {
+                    FailedSaveFile(info.label.to_string(), "Truncate failed".to_string())
+                })?;
             }
             log::info!(
                 "Saved {} bytes in {}ms",
