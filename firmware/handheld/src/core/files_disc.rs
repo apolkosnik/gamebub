@@ -22,6 +22,10 @@ use super::{command, disc, CoreManager};
 /// The absolute LBA of the image's first sector.
 const FIRST_LBA: u64 = 150;
 
+// A disc read takes the scratch buffer for a sector and a CHD's work space.
+const _: () =
+    assert!(disc::SECTOR_SIZE + disc::WORK_SIZE <= crate::bitstream::SCRATCH_SIZE);
+
 impl CoreManager {
     /// Whether the core's file `file_id` is an on-demand disc.
     pub(super) fn is_disc_file(&self, file_id: u16) -> bool {

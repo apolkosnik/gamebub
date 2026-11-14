@@ -20,8 +20,11 @@ mod util;
 /// while the other is sent). A large one keeps SD commands large: FatFs
 /// reads or writes at most one cluster per command, and the card spends
 /// about 1.4 ms on each command whatever its size (32 KiB clusters: up to
-/// 32 KiB per command).
-pub static SCRATCH: ScratchBuffer<{ 64 * 1024 }> = ScratchBuffer::new();
+/// 32 KiB per command). An on-demand disc read (`core/files_disc.rs`) also
+/// needs a sector and a CHD's work space in it.
+pub static SCRATCH: ScratchBuffer<{ SCRATCH_SIZE }> = ScratchBuffer::new();
+/// The size of [`SCRATCH`].
+pub const SCRATCH_SIZE: usize = 64 * 1024;
 
 /// Driver for a specific bitstream.
 pub trait Bitstream {
