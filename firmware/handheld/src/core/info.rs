@@ -102,10 +102,15 @@ pub struct CoreFile {
     /// behind the window; costs about the transfer time again).
     #[serde(default)]
     pub verify: bool,
-    /// If true, the file is a disc image, which the core reads on demand
-    /// (see `core::disc`): the files `dependent_on_0` are named after the
-    /// game rather than the disc (unless `per_disc`), and the pause menu
-    /// offers to change the disc.
+    /// If true (with `on_demand`), the file is a disc image (`.cue` with its
+    /// `.bin` files, a lone `.bin`, an `.iso` or a `.chd`): the files
+    /// `dependent_on_0` are named after the game rather than the disc (unless
+    /// `per_disc`), and the pause menu offers to change the disc. A core that
+    /// reads the file itself (`FILE_READ` on its id) gets one raw image of
+    /// 2352-byte sectors, track 1 at its start, and its table of contents
+    /// with `DISC_GET_TOC` (see `disc.rs`); a core may instead read the cue
+    /// sheet and image named after it as on-demand files of their own (the
+    /// PSX core does).
     #[serde(default)]
     pub disc: bool,
     /// If true, a file `dependent_on_0` on a disc image is named after the

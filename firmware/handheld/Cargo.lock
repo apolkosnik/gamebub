@@ -1954,6 +1954,7 @@ dependencies = [
  "esp-idf-svc",
  "heatshrink-lib",
  "hex",
+ "lightgun",
  "log",
  "natord",
  "postcard",
@@ -2737,6 +2738,10 @@ dependencies = [
  "libc",
  "pkg-config",
 ]
+
+[[package]]
+name = "lightgun"
+version = "0.1.0"
 
 [[package]]
 name = "linereader"

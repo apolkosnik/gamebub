@@ -21,11 +21,14 @@ use handler::CoreHandlerImpl;
 pub use info::*;
 use settings::CoreSettings;
 
+mod chd;
+mod chd_codec;
 mod command;
 mod disc;
 mod error;
 mod file_selection;
 mod files;
+mod files_disc;
 mod files_on_demand;
 mod handler;
 pub mod info;
@@ -57,6 +60,8 @@ pub struct CoreManager {
     selected_files: Vec<Option<PathBuf>>,
     /// The currently open on-demand file, if any.
     open_on_demand_file: Option<OnDemandFile>,
+    /// The currently open on-demand disc (`disc` file), if any.
+    open_disc: Option<(u16, disc::DiscImage)>,
     run_cartridge: bool,
     /// When the core last got focus, to put a duration on the statistics.
     focus_since: Option<Instant>,
@@ -87,6 +92,7 @@ impl CoreManager {
             core_settings: None,
             selected_files: Vec::new(),
             open_on_demand_file: None,
+            open_disc: None,
             run_cartridge: false,
             focus_since: None,
             changing_disc: None,
@@ -238,8 +244,10 @@ impl CoreManager {
         self.selected_files.clear();
         self.open_on_demand_file = None;
         self.changing_disc = None;
+        self.open_disc = None;
 
         InputManager::lock().clear_core_input_caps();
+        InputManager::lock().set_core(None, 0);
 
         let _ = Device::lock()
             .fpga
@@ -275,6 +283,24 @@ impl CoreManager {
             &mut [],
             NOTIFY_TIMEOUT,
         );
+
+        // A dock light gun, or a dock pad's right stick or dock mouse as a
+        // mouse, goes to a core that takes them while it runs with focus;
+        // otherwise a gun is a gamepad (for the menus). Which one, the core's
+        // Controller setting (the register the gun enables) says: its
+        // current value is passed here, so a change in the settings menu
+        // (which takes the focus) is taken when the game goes on.
+        {
+            let core = self
+                .core_info
+                .as_ref()
+                .filter(|_| has_focus && self.stage == Stage::Running);
+            let controller = core
+                .and_then(|core| lightgun::target_for_core(&core.id))
+                .and_then(|target| self.setting_value_at(target.enable))
+                .unwrap_or(0);
+            InputManager::lock().set_core(core.map(|core| core.id.as_str()), controller);
+        }
 
         let played = self.focus_since.take();
         if has_focus {
@@ -516,8 +542,10 @@ impl CoreManager {
             self.persist_files(goes_with_disc)?;
         }
 
-        // The old disc's file (or one named after it) may be open for the core.
+        // The old disc's file (or one named after it) may be open for the core,
+        // as a file or as the raw image the firmware serves (`files_disc`).
         self.open_on_demand_file = None;
+        self.open_disc = None;
         self.selected_files[index] = Some(path.to_path_buf());
         self.remember_path(index, path);
 

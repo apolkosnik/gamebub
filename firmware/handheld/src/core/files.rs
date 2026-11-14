@@ -35,6 +35,8 @@ pub(super) struct LoadProgress {
 /// For `FILE_READ_START`: a core may first finish the file (the PSX core
 /// holds it until a save state in progress is complete).
 const FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reads of a chunk of a file being saved, in pairs that must agree (see `persist_files`).
+const SAVE_READ_ATTEMPTS: u32 = 4;
 
 impl CoreManager {
     pub(super) fn load_files(&mut self) -> Result<(), CoreError> {
@@ -376,7 +378,15 @@ impl CoreManager {
                 .map_err(|_| FailedSaveFile(info.label.to_string(), "Open failed".to_string()))?;
             let old_size = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
             let mut scratch = crate::bitstream::SCRATCH.take().expect("scratch buffer");
-            let buf = scratch.deref_mut();
+            // Each chunk is read twice (into the two halves of the scratch
+            // buffer) and written only when both reads agree. The FPGA's SPI
+            // cannot wait for the core: a word the core does not have ready in
+            // time is sent as FFFFFFFF and the words after it shift, and the
+            // transfer itself reports nothing. A chunk that never reads the
+            // same twice fails the save before the file is touched.
+            let whole = scratch.deref_mut();
+            let half = whole.len() / 2;
+            let (buf, check) = whole.split_at_mut(half);
             let mut address: u32 = info.address;
             let mut bytes_left = file_size as usize;
 
@@ -385,13 +395,37 @@ impl CoreManager {
             while bytes_left > 0 {
                 let to_read = bytes_left.min(buf.len());
                 let data = &mut buf[0..to_read];
+                let again = &mut check[0..to_read];
 
                 let max_clock =
                     Some(Hertz(info.max_transfer_speed * 1000 * 2).min(MAX_SPI_READ_CLOCK));
                 let command = SpiCommand::new(info.transfer_word_size);
-                let _ = Device::lock()
-                    .fpga
-                    .spi_read(max_clock, command, address, data);
+                let read = |into: &mut [u8]| {
+                    Device::lock()
+                        .fpga
+                        .spi_read(max_clock, command, address, into)
+                        .is_ok()
+                };
+                let mut agreed = false;
+                for attempt in 0..SAVE_READ_ATTEMPTS {
+                    if read(data) && read(again) && data == again {
+                        agreed = true;
+                        break;
+                    }
+                    log::warn!(
+                        "Saving {}: bytes {:#x}..{:#x} read differently (attempt {})",
+                        info.label,
+                        address - info.address,
+                        address - info.address + to_read as u32,
+                        attempt + 1
+                    );
+                }
+                if !agreed {
+                    return Err(FailedSaveFile(
+                        info.label.to_string(),
+                        "The core's data did not read back the same".to_string(),
+                    ));
+                }
                 let write_start = Instant::now();
                 file.write_all(data).map_err(|_| {
                     FailedSaveFile(info.label.to_string(), "Write failed".to_string())
@@ -399,6 +433,11 @@ impl CoreManager {
                 write_duration += write_start.elapsed();
                 address += to_read as u32;
                 bytes_left -= to_read;
+            }
+            if old_size > file_size as u64 {
+                file.set_len(file_size as u64).map_err(|_| {
+                    FailedSaveFile(info.label.to_string(), "Truncate failed".to_string())
+                })?;
             }
             log::info!(
                 "Saved {} bytes in {}ms ({} ms write)",

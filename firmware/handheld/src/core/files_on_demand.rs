@@ -85,6 +85,9 @@ impl CoreManager {
 
     pub(super) fn handle_file_get_size(&mut self, params: &[u32], result: &mut [u32]) -> bool {
         let file_id = params[0] as u16;
+        if self.is_disc_file(file_id) {
+            return self.handle_disc_get_size(file_id, result);
+        }
         let file = match self.ensure_file_open(file_id) {
             Ok(file) => file,
             Err(status) => {
@@ -147,6 +150,9 @@ impl CoreManager {
 
     pub(super) fn handle_file_read(&mut self, params: &[u32], result: &mut [u32]) -> bool {
         let file_id = params[0] as u16;
+        if self.is_disc_file(file_id) {
+            return self.handle_disc_read(params, result);
+        }
         let address = params[1];
         let offset = ((params[3] as u64) << 32) | (params[2] as u64);
         let length = params[4] as usize;
