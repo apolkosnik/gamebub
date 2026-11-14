@@ -17,13 +17,14 @@ pub mod gba;
 
 mod util;
 
-/// File transfers go through this buffer. 64 KiB: an on-demand disc read
-/// (`core/files_disc.rs`) needs a sector and a CHD's work space in it, and
-/// large SD commands are faster (FatFs reads or writes at most one cluster
-/// per command, and the card spends about 1.4 ms on each).
-pub static SCRATCH: ScratchBuffer<{ 64 * 1024 }> = ScratchBuffer::new();
+/// File transfers go through this buffer. 16 KiB, as upstream: it is static
+/// memory that the heap does not get, and the heap is all there is for the UI
+/// (about 220 KiB in all). At 64 KiB, for a CHD's work space, the file
+/// selection screen ran out of memory; a CHD's work space is now allocated
+/// while a CHD is open (`core/disc.rs`).
+pub static SCRATCH: ScratchBuffer<{ 16 * 1024 }> = ScratchBuffer::new();
 /// The size of [`SCRATCH`].
-pub const SCRATCH_SIZE: usize = 64 * 1024;
+pub const SCRATCH_SIZE: usize = 16 * 1024;
 
 /// Driver for a specific bitstream.
 pub trait Bitstream {

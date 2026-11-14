@@ -33,8 +33,8 @@ use std::{
 use super::chd::Chd;
 
 pub const SECTOR_SIZE: usize = 2352;
-/// The scratch space [`DiscImage::read_sector`] needs for a CHD: two of its
-/// largest hunks and the decoders' tables.
+/// The work space [`DiscImage::read_sector`] needs for a CHD (allocated with
+/// the image): two of its largest hunks and the decoders' tables.
 pub const WORK_SIZE: usize = super::chd::WORK_SIZE;
 /// The user data of a MODE1 sector: what a 2048-byte-sector image holds.
 const COOKED_SIZE: usize = 2048;
@@ -73,6 +73,9 @@ pub struct DiscImage {
     /// track's `file_sector` on), all with the CHD's path.
     files: Vec<ImageFile>,
     chd: Option<Chd>,
+    /// A CHD's work space ([`WORK_SIZE`] bytes, word-aligned for the SD
+    /// card's DMA), allocated while the CHD is open; empty otherwise.
+    work: Vec<u32>,
     /// The first file, and one other (by index), once opened.
     first: Option<File>,
     other: Option<(usize, File)>,
@@ -272,6 +275,7 @@ impl DiscImage {
             Ok(DiscImage {
                 files: vec![ImageFile { path: path.to_path_buf(), cooked }],
                 chd: None,
+                work: Vec::new(),
                 first: None,
                 other: None,
                 tracks: vec![track],
@@ -436,7 +440,7 @@ impl DiscImage {
         }
         last.end = lead_out - 1;
 
-        Ok(DiscImage { files, chd: None, first: None, other: None, tracks, lead_out })
+        Ok(DiscImage { files, chd: None, work: Vec::new(), first: None, other: None, tracks, lead_out })
     }
 
     /// Open a CHD. As in MAME (`cdrom_file`), a track's pregap is either in
@@ -468,7 +472,15 @@ impl DiscImage {
             });
             lba = end + 1;
         }
-        Ok(DiscImage { files, chd: Some(chd), first: None, other: None, tracks, lead_out: lba })
+        // The work space comes from the heap for as long as the CHD is open:
+        // static, it was 58 KB less heap for every core and the menus.
+        let words = WORK_SIZE.div_ceil(4);
+        let mut work = Vec::<u32>::new();
+        work.try_reserve_exact(words).map_err(|_| {
+            format!("{}: not enough memory to read a CHD ({} KB in one piece)", path.display(), WORK_SIZE / 1024)
+        })?;
+        work.resize(words, 0);
+        Ok(DiscImage { files, chd: Some(chd), work, first: None, other: None, tracks, lead_out: lba })
     }
 
     pub fn log(&self) {
@@ -525,9 +537,8 @@ impl DiscImage {
     }
 
     /// Read the sector at absolute LBA `lba` (raw: from a 2048-byte-sector
-    /// file, made up around its user data). `work` is scratch space for a
-    /// CHD's hunks (see [`WORK_SIZE`]).
-    pub fn read_sector(&mut self, lba: u32, buffer: &mut [u8; SECTOR_SIZE], work: &mut [u8]) -> std::io::Result<()> {
+    /// file, made up around its user data).
+    pub fn read_sector(&mut self, lba: u32, buffer: &mut [u8; SECTOR_SIZE]) -> std::io::Result<()> {
         let track = self.tracks.iter().find(|t| lba >= t.start && lba <= t.end);
         let Some(track) = track.filter(|t| lba >= t.data_start && t.data_end.map_or(true, |end| lba <= end)) else {
             buffer.fill(0);
@@ -537,7 +548,11 @@ impl DiscImage {
         let index = track.file;
         let cooked = self.files[index].cooked;
         if let Some(chd) = &mut self.chd {
-            chd.read_frame(sector as u32, buffer, work)
+            // SAFETY: the words' own memory, as bytes, for this call.
+            let work = unsafe {
+                core::slice::from_raw_parts_mut(self.work.as_mut_ptr() as *mut u8, self.work.len() * 4)
+            };
+            chd.read_frame(sector as u32, buffer, &mut work[..WORK_SIZE])
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if cooked {
                 buffer.copy_within(0..COOKED_SIZE, 16);
