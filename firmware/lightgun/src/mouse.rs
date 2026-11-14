@@ -236,6 +236,11 @@ pub struct Target {
     /// Bits of the buttons register set while a dock mouse drives this one
     /// (the core chains the second mouse only then).
     pub connected: u32,
+    /// The core takes the mouse whatever its Controller setting is (it has
+    /// none), and only a physical mouse on the dock drives it: no stick, no
+    /// pad or handheld buttons (the core makes its own mouse of those), and
+    /// a light gun on the dock changes nothing.
+    pub standalone: bool,
 }
 
 /// The 3DO core (apolkosnik/3DO_GameBub, `rtl/gamebub/gb_host.sv`).
@@ -243,6 +248,17 @@ pub const TARGET_3DO: Target = Target {
     motion: 0x0000_1030,
     buttons: 0x0000_1034,
     connected: 0,
+    standalone: false,
+};
+
+/// The Minimig core (apolkosnik/Minimig_GameBub, `rtl/gamebub/gb_host.sv`):
+/// the Amiga's mouse in port 1, from a dock mouse only (the core itself
+/// makes the right stick and the handheld's buttons a mouse).
+pub const TARGET_MINIMIG: Target = Target {
+    motion: 0x0000_1030,
+    buttons: 0x0000_1034,
+    connected: 0,
+    standalone: true,
 };
 
 /// The 3DO core's second mouse, chained while a second dock mouse is
@@ -251,12 +267,14 @@ pub const TARGET_3DO_MOUSE2: Target = Target {
     motion: 0x0000_1038,
     buttons: 0x0000_103C,
     connected: 1 << 16,
+    standalone: false,
 };
 
 /// The mouse registers of a core, by its ID (core.json), if it takes one.
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
         crate::CORE_3DO => Some(TARGET_3DO),
+        crate::CORE_MINIMIG => Some(TARGET_MINIMIG),
         _ => None,
     }
 }
@@ -511,7 +529,8 @@ impl Mouse {
     /// (so the firmware should update it regularly, a stick held still
     /// moving it between reports).
     pub fn enabled(&self) -> bool {
-        self.target.is_some() && takes_mouse(self.controller)
+        self.target
+            .is_some_and(|target| target.standalone || takes_mouse(self.controller))
     }
 
     pub fn target(&self) -> Option<Target> {
@@ -546,6 +565,19 @@ impl Mouse {
         let mut writes = Writes::default();
         let Some(target) = self.target else {
             return writes;
+        };
+
+        // A standalone target's mouse is the dock mouse and nothing else.
+        let gun_connected = gun_connected && !target.standalone;
+        let dock_only;
+        let input = if target.standalone {
+            dock_only = MouseInput {
+                mouse: input.mouse,
+                ..MouseInput::default()
+            };
+            &dock_only
+        } else {
+            input
         };
 
         if !self.enabled() || gun_connected {
@@ -651,6 +683,7 @@ mod tests {
                 motion: 0x1030,
                 buttons: 0x1034,
                 connected: 0,
+                standalone: false,
             })
         );
         assert_eq!(target_for_core("Game-Bub.GBA"), None);
@@ -1671,5 +1704,43 @@ mod tests {
         m.update(500, false, &held);
         assert_eq!(writes(&m.update(600, true, &held)), [(0x1034, 0)]);
         assert!(m.update(700, true, &held).is_empty());
+    }
+
+    #[test]
+    fn minimig_takes_a_dock_mouse_whatever_the_setting() {
+        assert_eq!(target_for_core(crate::CORE_MINIMIG), Some(TARGET_MINIMIG));
+        assert_eq!(second_target_for_core(crate::CORE_MINIMIG), None);
+        let mut m = Mouse::new();
+        m.set_target(target_for_core("apolkosnik.Minimig"), CONTROLLER_PAD);
+        assert!(m.enabled());
+        // the buttons once, then a report's movement and a button
+        assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
+        m.report(&moved(5, -3));
+        assert_eq!(
+            writes(&m.update(1, false, &physical(button::LEFT))),
+            [(0x1030, pack_motion(5, -3)), (0x1034, 1)]
+        );
+        // a light gun on the dock does not stop it
+        m.report(&moved(2, 2));
+        assert_eq!(writes(&m.update(2, true, &physical(button::LEFT))), [(0x1030, pack_motion(2, 2))]);
+    }
+
+    #[test]
+    fn minimig_ignores_the_stick_and_the_pad_and_handheld_buttons() {
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_MINIMIG), CONTROLLER_PAD);
+        let input = MouseInput {
+            stick_x: FULL,
+            stick_y: FULL,
+            pad_r1: true,
+            pad_l1: true,
+            pad_r3: true,
+            handheld_l: true,
+            handheld_r: true,
+            ..MouseInput::default()
+        };
+        assert_eq!(writes(&m.update(0, false, &input)), [(0x1034, 0)]);
+        assert_eq!(writes(&m.update(500, false, &input)), []);
+        assert_eq!(writes(&m.update(1000, false, &input)), []);
     }
 }

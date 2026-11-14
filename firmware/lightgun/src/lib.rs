@@ -26,11 +26,15 @@
 //! or else from a dock gamepad's right stick (and the handheld's own L and
 //! R as its buttons either way).
 //!
+//! The `keyboard` module turns a USB keyboard on the dock into key events
+//! for a core that takes one (the Minimig core).
+//!
 //! Everything here is pure logic, without the firmware's dependencies, so it
 //! runs on the host: `cargo test` in this directory.
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod keyboard;
 pub mod mouse;
 
 /// The dock's light gun buttons (bits of `GamepadData`'s buttons word).
@@ -113,6 +117,10 @@ pub const TARGET_3DO: Target = Target {
     aim: 0x0000_1018,
     buttons: 0x0000_101C,
 };
+
+/// The Minimig core (apolkosnik/Minimig_GameBub): no light gun, but a mouse
+/// (`mouse`) and a keyboard (`keyboard`).
+pub const CORE_MINIMIG: &str = "apolkosnik.Minimig";
 
 /// The light gun registers of a core, by its ID (core.json), if it takes one.
 pub fn target_for_core(core_id: &str) -> Option<Target> {

@@ -1,6 +1,7 @@
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
+use lightgun::keyboard::{self, KeySet, Keyboard, KeyboardReport};
 use lightgun::mouse::{self, Mouse, MouseInput, MouseReport};
 use lightgun::{CalibrationEvent, GunReport};
 
@@ -94,6 +95,17 @@ impl InputState {
         }
     }
 
+    /// Whether this is a keyboard on the dock: its buttons' low byte is its
+    /// modifier keys, its left axes the keys held (`KeyboardReport`). A
+    /// keyboard is never a gamepad.
+    pub fn is_keyboard(&self) -> bool {
+        KeyboardReport::is_keyboard(self.raw_buttons)
+    }
+
+    pub fn keyboard_report(&self) -> KeyboardReport {
+        KeyboardReport::from_dock(self.raw_buttons, self.axis_lx, self.axis_ly, self.axis_lz)
+    }
+
     /// The state as a gamepad: a light gun's aim and distance are not
     /// sticks or a trigger.
     fn as_pad(&self) -> InputState {
@@ -143,10 +155,11 @@ impl InputState {
     }
 
     /// Whether this dock device is a pad: not a mouse (its movement is not
-    /// a stick, its buttons are not a pad's), nor a light gun the running
+    /// a stick, its buttons are not a pad's), not a keyboard (its keys are
+    /// in the axes), nor a light gun the running
     /// core takes as one (`gun_active`).
     fn is_pad(&self, gun_active: bool) -> bool {
-        !self.is_mouse() && !(self.is_light_gun() && gun_active)
+        !self.is_mouse() && !self.is_keyboard() && !(self.is_light_gun() && gun_active)
     }
 
     fn merge_gamepads(&mut self, gamepads: &[Gamepad], gun_active: bool) {
@@ -207,6 +220,10 @@ pub struct InputManager {
     /// The core's second mouse, driven by the second dock mouse (the core
     /// chains it while that mouse is connected).
     mouse2: Mouse,
+
+    /// The keyboard of the running core, if it takes one: the dock's
+    /// keyboards.
+    keyboard: Keyboard,
 
     /// Time base for the light gun and the mouse (its first use).
     epoch: Option<Instant>,
@@ -317,6 +334,8 @@ impl InputManager {
         )));
         self.update_ui();
         self.sync_fpga();
+        // (a keyboard that went: its keys are released)
+        self.send_keyboard();
     }
 
     pub fn remove_all_gamepads(&mut self) {
@@ -325,6 +344,7 @@ impl InputManager {
         self.gamepads.clear();
         self.update_ui();
         self.sync_fpga();
+        self.send_keyboard();
     }
 
     pub fn update_gamepad(&mut self, id: GamepadId, state: InputState) {
@@ -364,6 +384,7 @@ impl InputManager {
             self.sync_fpga();
             self.send_light_gun();
             self.send_mouse();
+            self.send_keyboard();
         }
     }
 
@@ -496,12 +517,22 @@ impl InputManager {
             );
             ui::send(ui::Message::MouseTick(self.mouse.enabled()));
         }
+        let had_keyboard = self.keyboard.enabled();
+        self.keyboard
+            .set_target(core_id.and_then(keyboard::target_for_core));
+        if self.keyboard.enabled() != had_keyboard {
+            log::info!(
+                "Keyboard: {}",
+                if self.keyboard.enabled() { "the dock's keyboards" } else { "off" }
+            );
+        }
         // The gun stops (or starts) being a gamepad, and the core's
         // registers are written.
         self.update_ui();
         self.sync_fpga();
         self.send_light_gun();
         self.send_mouse();
+        self.send_keyboard();
     }
 
     /// Milliseconds since the light gun's or the mouse's first use.
@@ -630,6 +661,31 @@ impl InputManager {
         if !writes.is_empty() || !writes2.is_empty() {
             let mut device = Device::lock();
             for &(address, value) in writes.as_slice().iter().chain(writes2.as_slice()) {
+                let _ = device.fpga.write_u32(address, value);
+            }
+        }
+    }
+
+    /// Write the key events that bring the core's keyboard to the keys held
+    /// on the dock's keyboards now (all of them as one), to the core that
+    /// takes a keyboard: on every report of a keyboard, when one goes, and
+    /// when the core gets the focus back (the keys let go meanwhile).
+    fn send_keyboard(&mut self) {
+        if !self.keyboard.enabled() {
+            return;
+        }
+        let mut down = KeySet::new();
+        for gamepad in self.gamepads.iter().filter(|g| g.state.is_keyboard()) {
+            gamepad.state.keyboard_report().add_to(&mut down);
+        }
+        // (an update gives at most `keyboard::MAX_EVENTS`)
+        while self.keyboard.pending(&down) {
+            let events = self.keyboard.update(&down);
+            if events.is_empty() {
+                break;
+            }
+            let mut device = Device::lock();
+            for &(address, value) in events.as_slice() {
                 let _ = device.fpga.write_u32(address, value);
             }
         }
