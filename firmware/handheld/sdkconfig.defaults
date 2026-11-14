@@ -7,7 +7,12 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_32KB=y
 
 # Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=20480
+# The UI runs on the main task. Creating a screen's Slint component takes
+# frames of several KB each (10 KB for the file selection's, 7 KB and 2 KB on
+# the way into the game screen), and 20 KB was within a few hundred bytes of
+# full: a change of the core settings list grew two of those frames by 0.9 KB
+# and every core then overflowed the stack while loading.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
 # Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
 # This allows to use 1 ms granuality for thread sleeps (10 ms by default).
