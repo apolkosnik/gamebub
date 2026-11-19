@@ -183,7 +183,7 @@ impl Device<'_> {
                                 .fpga
                                 .write_u32(fpga::REG_CTRL_IRQ_PENDING, fpga_irq)
                                 .unwrap();
-                            worker::send(worker::Message::FpgaIrq(fpga_irq));
+                            worker::send_fpga_irq(fpga_irq);
                         }
                         if (fpga_irq & fpga::Irq::Button.as_flag()) != 0 {
                             poll_buttons = true;
