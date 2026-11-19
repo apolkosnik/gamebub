@@ -40,9 +40,6 @@ use std::{
 use super::chd::Chd;
 
 pub const SECTOR_SIZE: usize = 2352;
-/// The work space [`DiscImage::read_sector`] needs for a CHD (allocated with
-/// the image): two of its largest hunks and the decoders' tables.
-pub const WORK_SIZE: usize = super::chd::WORK_SIZE;
 /// The user data of a MODE1 sector: what a 2048-byte-sector image holds.
 const COOKED_SIZE: usize = 2048;
 /// The sync pattern that starts every raw data sector.
@@ -80,9 +77,12 @@ pub struct DiscImage {
     /// track's `file_sector` on), all with the CHD's path.
     files: Vec<ImageFile>,
     chd: Option<Chd>,
-    /// A CHD's work space ([`WORK_SIZE`] bytes, word-aligned for the SD
-    /// card's DMA), allocated while the CHD is open; empty otherwise.
-    work: Vec<u32>,
+    /// A CHD's work space, the pieces it needs (`Chd::work_sizes`: the
+    /// compressed hunk, the whole hunk, the decoders' tables), each its own
+    /// allocation (no 57 KB in one piece: at a core's start the heap had 35
+    /// KB), word-aligned for the SD card's DMA, while the CHD is open; empty
+    /// otherwise.
+    work: [Vec<u32>; 3],
     /// The first file, and one other (by index), once opened.
     first: Option<File>,
     other: Option<(usize, File)>,
@@ -282,7 +282,7 @@ impl DiscImage {
             Ok(DiscImage {
                 files: vec![ImageFile { path: path.to_path_buf(), cooked }],
                 chd: None,
-                work: Vec::new(),
+                work: Default::default(),
                 first: None,
                 other: None,
                 tracks: vec![track],
@@ -447,7 +447,7 @@ impl DiscImage {
         }
         last.end = lead_out - 1;
 
-        Ok(DiscImage { files, chd: None, work: Vec::new(), first: None, other: None, tracks, lead_out })
+        Ok(DiscImage { files, chd: None, work: Default::default(), first: None, other: None, tracks, lead_out })
     }
 
     /// Open a CHD. As in MAME (`cdrom_file`), a track's pregap is either in
@@ -480,18 +480,41 @@ impl DiscImage {
             lba = end + 1;
         }
         // The work space comes from the heap for as long as the CHD is open:
-        // static, it was 58 KB less heap for every core and the menus.
-        let words = WORK_SIZE.div_ceil(4);
-        let mut work = Vec::<u32>::new();
-        work.try_reserve_exact(words).map_err(|_| {
-            format!("{}: not enough memory to read a CHD ({} KB in one piece)", path.display(), WORK_SIZE / 1024)
-        })?;
-        work.resize(words, 0);
+        // static, it was 58 KB less heap for every core and the menus. Only
+        // the pieces this CHD's codecs need, the largest first.
+        let mut work: [Vec<u32>; 3] = Default::default();
+        let sizes = chd.work_sizes();
+        let mut order = [0, 1, 2];
+        order.sort_by_key(|&i| core::cmp::Reverse(sizes[i]));
+        for i in order {
+            let words = sizes[i].div_ceil(4);
+            if words == 0 {
+                continue;
+            }
+            work[i].try_reserve_exact(words).map_err(|_| {
+                format!(
+                    "{}: not enough memory to read a CHD ({} KB in pieces of at most {} KB)",
+                    path.display(),
+                    sizes.iter().sum::<usize>().div_ceil(1024),
+                    sizes.iter().max().unwrap().div_ceil(1024)
+                )
+            })?;
+            work[i].resize(words, 0);
+        }
         Ok(DiscImage { files, chd: Some(chd), work, first: None, other: None, tracks, lead_out: lba })
+    }
+
+    /// The CHD work space's pieces as allocated (bytes: the compressed
+    /// hunk, the whole hunk, the decoders' tables; all 0 without a CHD).
+    pub fn chd_work_sizes(&self) -> [usize; 3] {
+        self.work.each_ref().map(|w| w.len() * 4)
     }
 
     pub fn log(&self) {
         log::info!("Disc: {} tracks, lead-out at {}", self.tracks.len(), self.lead_out);
+        if self.chd.is_some() {
+            log::info!("  CHD work space in pieces of {:?} bytes", self.chd_work_sizes());
+        }
         for t in &self.tracks {
             log::info!(
                 "  track {:2} {}: {}-{}, index 1 at {}, file {} ({}) from sector {}",
@@ -556,10 +579,11 @@ impl DiscImage {
         let cooked = self.files[index].cooked;
         if let Some(chd) = &mut self.chd {
             // SAFETY: the words' own memory, as bytes, for this call.
-            let work = unsafe {
-                core::slice::from_raw_parts_mut(self.work.as_mut_ptr() as *mut u8, self.work.len() * 4)
-            };
-            chd.read_frame(sector as u32, buffer, &mut work[..WORK_SIZE])
+            let [compressed, full, decoder] = self
+                .work
+                .each_mut()
+                .map(|w| unsafe { core::slice::from_raw_parts_mut(w.as_mut_ptr() as *mut u8, w.len() * 4) });
+            chd.read_frame_parts(sector as u32, buffer, compressed, full, decoder)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if cooked {
                 buffer.copy_within(0..COOKED_SIZE, 16);
