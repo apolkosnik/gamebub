@@ -307,6 +307,7 @@ impl CoreManager {
     }
 
     fn finish_loading_inner(&mut self) -> Result<(), CoreError> {
+        self.open_chd_disc_early();
         self.load_bitstream();
 
         // Wait for the core to be ready for setup.

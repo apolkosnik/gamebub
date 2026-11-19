@@ -34,6 +34,39 @@ impl CoreManager {
             .is_some_and(|core| core.files.iter().any(|f| f.id == file_id && f.on_demand && f.disc))
     }
 
+    /// Open the core's on-demand disc now, before the core runs, if it is a
+    /// CHD: its work space (up to `chd::WORK_SIZE`, 57 KB, in pieces of up
+    /// to 19 KB) comes from the heap, and once the core runs the heap is too
+    /// fragmented for it (the largest free block a few KB), so opened on the
+    /// core's first request the CHD could not be read ("Cannot open the disc
+    /// image"). Other images take nothing from the heap to read and stay
+    /// opened on first use. Only one disc is open at a time.
+    pub(super) fn open_chd_disc_early(&mut self) {
+        let Some(core) = self.core_info.as_ref() else {
+            return;
+        };
+        let chd = core.files.iter().enumerate().find_map(|(i, f)| {
+            let path = self.selected_files.get(i)?.as_ref()?;
+            let is_chd = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("chd"));
+            (f.on_demand && f.disc && is_chd).then_some(f.id)
+        });
+        let Some(file_id) = chd else {
+            return;
+        };
+        // SAFETY: heap statistics, no side effects.
+        let (free, largest) = unsafe {
+            (
+                esp_idf_svc::sys::esp_get_free_heap_size(),
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT),
+            )
+        };
+        log::info!(
+            "Opening the CHD before the core runs: {free} B free, largest block {largest} B"
+        );
+        // (an error is shown by `disc_image`; the core's first request tries again)
+        let _ = self.disc_image(file_id);
+    }
+
     /// The disc in file `file_id`, opened on its first use.
     fn disc_image(&mut self, file_id: u16) -> Result<&mut disc::DiscImage, u32> {
         if self.open_disc.as_ref().is_some_and(|(id, _)| *id == file_id) {
@@ -48,9 +81,23 @@ impl CoreManager {
         };
         let image = disc::DiscImage::open(path).map_err(|e| {
             log::error!("Disc {}: {e}", path.display());
-            crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(
-                "Cannot open the disc image".to_string(),
-            )));
+            let text = if e.contains("not enough memory") {
+                // SAFETY: heap statistics, no side effects.
+                let (free, largest) = unsafe {
+                    (
+                        esp_idf_svc::sys::esp_get_free_heap_size(),
+                        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT),
+                    )
+                };
+                format!(
+                    "Cannot open the disc image: not enough memory for a CHD ({} KB free, {} KB in one piece)",
+                    free / 1024,
+                    largest / 1024
+                )
+            } else {
+                "Cannot open the disc image".to_string()
+            };
+            crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(text)));
             command::FILE_STATUS_ERR_IO
         })?;
         image.log();

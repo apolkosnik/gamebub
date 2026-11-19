@@ -41,8 +41,10 @@ const TRACK_PADDING: u32 = 4;
 /// The decoders' share of the work space (LZMA probabilities or FLAC
 /// samples), with room to align it.
 const DECODER_SPACE: usize = 4 * chd_codec::FLAC_SAMPLES + 8;
-/// The work space [`Chd::read_frame`] needs: the compressed hunk, the whole
-/// hunk for the generic codecs, and the decoders' tables.
+/// The work space [`Chd::read_frame_parts`] needs, at most: the compressed
+/// hunk, the whole hunk for the generic codecs, and the decoders' tables. A
+/// CHD needs only some of it ([`Chd::work_sizes`]), in separate pieces.
+#[allow(dead_code)]
 pub const WORK_SIZE: usize = 2 * MAX_HUNK_FRAMES as usize * FRAME_SIZE + DECODER_SPACE;
 const _: () = assert!(DECODER_SPACE >= 2 * chd_codec::LZMA_PROBS + 2);
 /// Hunks between two checkpoints of the map decoder.
@@ -695,10 +697,35 @@ impl Chd {
         self.hunk_bytes as usize / FRAME_SIZE
     }
 
+    /// The pieces of work space this CHD needs (bytes, 0: none), for
+    /// [`Chd::read_frame_parts`]: the compressed hunk (also an uncompressed
+    /// one), the whole hunk for the generic codecs (zlib, lzma; none for the
+    /// CD codecs, which decode into the cache), and the decoders' tables
+    /// (lzma, cdlz, cdfl).
+    pub fn work_sizes(&self) -> [usize; 3] {
+        let uses = |codec: u32| self.codecs.contains(&codec);
+        let hunk_bytes = self.hunk_bytes as usize;
+        let full = if uses(CODEC_ZLIB) || uses(CODEC_LZMA) { hunk_bytes } else { 0 };
+        let decoder =
+            if uses(CODEC_LZMA) || uses(CODEC_CD_LZMA) || uses(CODEC_CD_FLAC) { DECODER_SPACE } else { 0 };
+        [hunk_bytes, full, decoder]
+    }
+
     /// Read frame `frame`'s sector data (2352 bytes, as in the CHD: audio
-    /// samples big-endian) into `out`. `work` is scratch space of at least
-    /// [`WORK_SIZE`] bytes.
-    pub fn read_frame(&mut self, frame: u32, out: &mut [u8], work: &mut [u8]) -> Result<(), String> {
+    /// samples big-endian) into `out`, with the work space in pieces as
+    /// large as [`Chd::work_sizes`] says (or larger).
+    pub fn read_frame_parts(
+        &mut self,
+        frame: u32,
+        out: &mut [u8],
+        compressed: &mut [u8],
+        full: &mut [u8],
+        decoder: &mut [u8],
+    ) -> Result<(), String> {
+        let [need_compressed, need_full, need_decoder] = self.work_sizes();
+        if compressed.len() < need_compressed || full.len() < need_full || decoder.len() < need_decoder {
+            return Err("work buffer too small".into());
+        }
         let frames = self.frames() as u32;
         let hunk = frame / frames;
         if hunk >= self.hunk_count {
@@ -707,7 +734,7 @@ impl Chd {
         }
         if self.cached != Some(hunk) {
             self.cached = None;
-            self.load_hunk(hunk, work).map_err(|e| format!("hunk {hunk}: {e}"))?;
+            self.load_hunk(hunk, compressed, full, decoder).map_err(|e| format!("hunk {hunk}: {e}"))?;
             self.cached = Some(hunk);
         }
         let at = (frame % frames) as usize * SECTOR_DATA;
@@ -715,11 +742,8 @@ impl Chd {
         Ok(())
     }
 
-    fn load_hunk(&mut self, hunk: u32, work: &mut [u8]) -> Result<(), String> {
+    fn load_hunk(&mut self, hunk: u32, compressed: &mut [u8], full: &mut [u8], decoder: &mut [u8]) -> Result<(), String> {
         let hunk_bytes = self.hunk_bytes as usize;
-        if work.len() < 2 * hunk_bytes + DECODER_SPACE {
-            return Err("work buffer too small".into());
-        }
         let mut e = self.entry(hunk)?;
         // A self reference repeats an earlier hunk (which is never one itself
         // as chdman writes them, but follow a chain all the same).
@@ -731,17 +755,17 @@ impl Chd {
             }
             e = self.entry(e.offset as u32)?;
         }
-        let (compressed, rest) = work.split_at_mut(hunk_bytes);
-        let (rest, decoder) = rest.split_at_mut(hunk_bytes);
         match e.kind {
             COMPRESSION_NONE => {
-                let full = &mut rest[..hunk_bytes];
+                // (the compressed hunk's piece: an uncompressed hunk is read
+                // straight into it)
+                let raw = &mut compressed[..hunk_bytes];
                 if e.length == 0 {
-                    full.fill(0);
+                    raw.fill(0);
                 } else {
-                    self.read_at(e.offset, full)?;
+                    self.read_at(e.offset, raw)?;
                 }
-                self.deinterleave(full);
+                self.deinterleave(raw);
             }
             COMPRESSION_TYPE_0..=COMPRESSION_TYPE_3 => {
                 let len = e.length as usize;
@@ -750,7 +774,9 @@ impl Chd {
                 }
                 self.read_at(e.offset, &mut compressed[..len])?;
                 let codec = self.codecs[e.kind as usize];
-                self.decompress(codec, &compressed[..len], rest, decoder)
+                // (the whole hunk exactly, as before; empty for the CD codecs)
+                let full_len = if full.len() >= hunk_bytes { hunk_bytes } else { full.len() };
+                self.decompress(codec, &compressed[..len], &mut full[..full_len], decoder)
                     .map_err(|err| format!("{}: {err}", codec_name(codec)))?;
             }
             other => return Err(format!("map entry type {other}")),
