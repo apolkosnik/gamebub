@@ -124,8 +124,8 @@ pub struct UI {
     state: Rc<RefCell<UiState>>,
     button_event_detector: buttons::ButtonEventDetector,
     idle_timer: Timer,
-    /// The mouse tick (`Message::MouseTick`), running while a core's mouse
-    /// is driven from a stick.
+    /// The input tick (`Message::MouseTick`), running while a core takes a
+    /// mouse or the light gun (`InputManager::mouse_tick`).
     mouse_timer: Timer,
 }
 

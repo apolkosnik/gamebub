@@ -480,9 +480,10 @@ impl InputManager {
     /// for the light gun and the mouse it takes, if any
     /// (`lightgun::target_for_core`, `lightgun::mouse::target_for_core`):
     /// their registers are all written again. The gun's calibration comes
-    /// from the KVS. The mouse tick (`ui::Message::MouseTick`) runs while
-    /// the core takes the mouse and the setting selects it.
+    /// from the KVS. The input tick (`ui::Message::MouseTick`) runs while
+    /// the core takes the light gun, or the mouse and the setting selects it.
     pub fn set_core(&mut self, core_id: Option<&str>, controller: u32) {
+        let was_ticking = self.ticking();
         let target = core_id.and_then(lightgun::target_for_core);
         let calibration = target
             .and_then(calibration_key)
@@ -497,12 +498,12 @@ impl InputManager {
         }
         self.light_gun.set_target(target, calibration, controller);
 
-        let was_ticking = self.mouse.enabled();
+        let had_mouse = self.mouse.enabled();
         self.mouse
             .set_target(core_id.and_then(mouse::target_for_core), controller);
         self.mouse2
             .set_target(core_id.and_then(mouse::second_target_for_core), controller);
-        if self.mouse.enabled() != was_ticking {
+        if self.mouse.enabled() != had_mouse {
             log::info!(
                 "Mouse: {}",
                 if self.mouse.enabled() {
@@ -511,7 +512,9 @@ impl InputManager {
                     "off"
                 }
             );
-            ui::send(ui::Message::MouseTick(self.mouse.enabled()));
+        }
+        if self.ticking() != was_ticking {
+            ui::send(ui::Message::MouseTick(self.ticking()));
         }
         let had_keyboard = self.keyboard.enabled();
         self.keyboard
@@ -569,6 +572,22 @@ impl InputManager {
             for &(address, value) in writes.as_slice() {
                 let _ = device.fpga.write_u32(address, value);
             }
+        }
+
+        if let Some(notice) = self.light_gun.take_notice() {
+            let text = match notice {
+                lightgun::GunNotice::NoScreen => {
+                    log::warn!("Light gun: off screen for a while, no IR emitters seen");
+                    "Light gun: cannot see the screen. Check the IR emitters"
+                }
+                lightgun::GunNotice::ScreenFound => {
+                    log::info!("Light gun: sees the screen");
+                    "Light gun: sees the screen"
+                }
+            };
+            ui::send(ui::Message::Notification(ui::Notification::new_long(
+                text.to_string(),
+            )));
         }
 
         let Some(event) = event else {
@@ -689,8 +708,19 @@ impl InputManager {
 
     /// The mouse tick (`ui::Message::MouseTick`, every
     /// `lightgun::mouse::MIN_MOTION_INTERVAL_MS` while the mouse is on).
+    ///
+    /// It runs while the core takes the light gun too: the dock sends a
+    /// gun's report only when it changes, so a gun held still (C1 + C2 held
+    /// to calibrate, an aim held back by `MIN_AIM_INTERVAL_MS`, a gun that
+    /// keeps reporting off screen) is fed its last report again here.
     pub fn mouse_tick(&mut self) {
+        self.send_light_gun();
         self.send_mouse();
+    }
+
+    /// Whether the tick (`mouse_tick`) runs: a mouse, or a light gun.
+    fn ticking(&self) -> bool {
+        self.mouse.enabled() || self.light_gun.active()
     }
 }
 
