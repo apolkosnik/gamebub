@@ -1,6 +1,7 @@
 //! Worker threads to do background blocking work.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 
 use crate::core::CoreManager;
@@ -12,8 +13,9 @@ use crate::{kvs, ui};
 
 #[derive(Debug)]
 pub enum Message {
-    /// An interrupt request from the FPGA
-    FpgaIrq(u32),
+    /// Interrupt requests from the FPGA: the bits are collected by
+    /// `send_fpga_irq`.
+    FpgaIrq,
     /// The headphone state has changed
     HeadphoneState(bool),
     /// The handheld has docked
@@ -59,17 +61,79 @@ pub enum Message {
     CoreSettingChanged { id: u16, value: u32 },
 }
 
+/// Room in the worker's queue. The queue is allocated once, at start: an
+/// unbounded channel allocates a block for every 31 messages sent, even with
+/// the queue empty, and while a core runs the heap is too fragmented for that
+/// (a crash in the TinyUSB task, allocating a block for a dock packet, with
+/// 31 KB free). The queue never fills: gamepad input takes at most
+/// `MAX_PENDING_INPUT` of it, FPGA interrupts one (`send_fpga_irq`), and the
+/// rest (docking, the UI) come at a human rate.
+const QUEUE_LEN: usize = 64;
+
+/// Gamepad input messages waiting at most: more are dropped while the worker
+/// is busy (a save, a disc image being opened). A dock mouse sends hundreds a
+/// second; the next report of a pad has its whole state again.
+const MAX_PENDING_INPUT: usize = 32;
+
+/// Gamepad input messages waiting in the queue.
+static PENDING_INPUT: AtomicUsize = AtomicUsize::new(0);
+/// Gamepad input messages dropped since the last one that was taken.
+static DROPPED_INPUT: AtomicU32 = AtomicU32::new(0);
+
+/// FPGA interrupts not yet handled (`send_fpga_irq`); one `FpgaIrq` message
+/// in the queue stands for all of them.
+static PENDING_FPGA_IRQ: AtomicU32 = AtomicU32::new(0);
+
 /// Send a message to the worker threads.
+///
+/// Gamepad input is dropped while `MAX_PENDING_INPUT` wait. Anything else
+/// waits for room if the queue is full, which it should never be.
 pub fn send(message: Message) {
-    match SENDER.get() {
-        Some(sender) => sender.send(message).unwrap(),
-        None => log::error!("Dropping worker message {:?}", message),
+    let Some(sender) = SENDER.get() else {
+        log::error!("Dropping worker message {:?}", message);
+        return;
+    };
+    let input = matches!(message, Message::GamepadInput(..));
+    if input {
+        if PENDING_INPUT.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_INPUT {
+            PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
+            DROPPED_INPUT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    match sender.try_send(message) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(message)) => {
+            if input {
+                PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
+                DROPPED_INPUT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                log::warn!("Worker queue full: waiting to send {:?}", message);
+                let _ = sender.send(message);
+            }
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => panic!("worker gone"),
+    }
+}
+
+/// Send FPGA interrupts (`REG_CTRL_IRQ_PENDING` bits) to the worker: they are
+/// collected, and one `FpgaIrq` message waits for all of them (the module's
+/// vblank alone comes 60 times a second, also while the worker is busy).
+pub fn send_fpga_irq(irq_mask: u32) {
+    if SENDER.get().is_none() {
+        // (not started: dropped, as `send` would, so that nothing is left
+        // pending that no message will ever take)
+        log::error!("Dropping FPGA IRQ {irq_mask:#x}");
+        return;
+    }
+    if PENDING_FPGA_IRQ.fetch_or(irq_mask, Ordering::AcqRel) == 0 {
+        send(Message::FpgaIrq);
     }
 }
 
 /// Start the worker threadpool. Called once during system init. Panics if called twice.
 pub fn start() {
-    let (sender, receiver) = mpsc::channel::<Message>();
+    let (sender, receiver) = mpsc::sync_channel::<Message>(QUEUE_LEN);
     SENDER.set(sender).expect("Worker already initialized");
 
     // TODO: look into reducing stack usage
@@ -85,11 +149,12 @@ pub fn start() {
         .unwrap();
 }
 
-static SENDER: OnceLock<mpsc::Sender<Message>> = OnceLock::new();
+static SENDER: OnceLock<mpsc::SyncSender<Message>> = OnceLock::new();
 
 fn dispatch(message: Message) {
     match message {
-        Message::FpgaIrq(irq_mask) => {
+        Message::FpgaIrq => {
+            let irq_mask = PENDING_FPGA_IRQ.swap(0, Ordering::AcqRel);
             if (irq_mask & fpga::Irq::ModuleVblank.as_flag()) != 0 {
                 // Module vblank
                 if let Some(bitstream) = CoreManager::lock().current_bitstream() {
@@ -144,6 +209,11 @@ fn dispatch(message: Message) {
             InputManager::lock().remove_gamepad(id);
         }
         Message::GamepadInput(id, state) => {
+            PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
+            let dropped = DROPPED_INPUT.swap(0, Ordering::Relaxed);
+            if dropped != 0 {
+                log::warn!("Worker busy: {dropped} gamepad input messages dropped");
+            }
             InputManager::lock().update_gamepad(id, state);
         }
         Message::IdleTimerExpired => {
