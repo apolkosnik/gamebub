@@ -164,8 +164,8 @@ pub struct UI {
     is_dimmed: Rc<Cell<bool>>,
     home_pressed: bool,
     home_consumed: bool,
-    /// The mouse tick (`Message::MouseTick`), running while a core's mouse
-    /// is driven from a stick.
+    /// The input tick (`Message::MouseTick`), running while a core takes a
+    /// mouse or the light gun (`InputManager::mouse_tick`).
     mouse_timer: Timer,
 }
 

@@ -380,6 +380,32 @@ impl Calibrator {
 /// Least time between two writes of a moving aim (about 120 Hz).
 pub const MIN_AIM_INTERVAL_MS: u64 = 8;
 
+/// How long the gun reports off screen, from its first report or from the
+/// last time it saw the screen, before the user is told it does not see the
+/// screen (its IR emitters). Shooting off screen to reload is much shorter.
+pub const NO_SCREEN_NOTICE_MS: u64 = 3000;
+
+/// What the user is told about the gun itself (not about calibration).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GunNotice {
+    /// Off screen for `NO_SCREEN_NOTICE_MS`: the gun sees no IR emitters.
+    /// Told at most once while the gun stays connected.
+    NoScreen,
+    /// The gun sees the screen again after `NoScreen` (told once).
+    ScreenFound,
+}
+
+/// Where the gun is with `GunNotice`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ScreenWatch {
+    /// Watching for a long time off screen.
+    Watching,
+    /// `NoScreen` told: watching for the screen.
+    Told,
+    /// `ScreenFound` told: nothing more until the gun goes.
+    Done,
+}
+
 /// Register writes for the core, in order: (address, value).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Writes {
@@ -420,6 +446,11 @@ pub struct Controller {
     sent_aim: Option<u32>,
     sent_buttons: Option<u32>,
     last_aim_write: Option<u64>,
+    /// Since when the gun has reported off screen (None: on screen or gone).
+    off_since: Option<u64>,
+    screen_watch: ScreenWatch,
+    /// A notice for the user, until `take_notice`.
+    notice: Option<GunNotice>,
 }
 
 impl Default for Controller {
@@ -443,7 +474,15 @@ impl Controller {
             sent_aim: None,
             sent_buttons: None,
             last_aim_write: None,
+            off_since: None,
+            screen_watch: ScreenWatch::Watching,
+            notice: None,
         }
+    }
+
+    /// What to tell the user about the gun, once (see `GunNotice`).
+    pub fn take_notice(&mut self) -> Option<GunNotice> {
+        self.notice.take()
     }
 
     /// The core taking the gun now (None: no core, or one without a gun, or
@@ -488,6 +527,26 @@ impl Controller {
         self.calibrator.active()
     }
 
+    /// `GunNotice`: a gun that keeps reporting off screen (it sees no IR
+    /// emitters) is told once, and then once that it sees the screen.
+    fn watch_screen(&mut self, now_ms: u64, report: &GunReport) {
+        if report.off_screen() {
+            let since = *self.off_since.get_or_insert(now_ms);
+            if self.screen_watch == ScreenWatch::Watching
+                && now_ms.saturating_sub(since) >= NO_SCREEN_NOTICE_MS
+            {
+                self.screen_watch = ScreenWatch::Told;
+                self.notice = Some(GunNotice::NoScreen);
+            }
+        } else {
+            self.off_since = None;
+            if self.screen_watch == ScreenWatch::Told {
+                self.screen_watch = ScreenWatch::Done;
+                self.notice = Some(GunNotice::ScreenFound);
+            }
+        }
+    }
+
     /// The gun's state at `now_ms` (its latest report; None: no gun): the
     /// writes for the core, and what calibration has to say.
     ///
@@ -510,6 +569,8 @@ impl Controller {
         let Some(report) = gun else {
             self.calibrator.reset();
             self.hold_back = false;
+            self.off_since = None;
+            self.screen_watch = ScreenWatch::Watching;
             if self.sent_buttons != Some(BUTTONS_RELEASED) {
                 writes.push(target.buttons, BUTTONS_RELEASED);
                 self.sent_buttons = Some(BUTTONS_RELEASED);
@@ -521,6 +582,7 @@ impl Controller {
             return (writes, None);
         };
 
+        self.watch_screen(now_ms, report);
         let event = self.calibrator.update(now_ms, report);
         if let Some(CalibrationEvent::Finished(calibration)) = event {
             self.calibration = calibration;
@@ -1040,5 +1102,82 @@ mod tests {
         t += 100;
         let (w, _) = c.update(t, Some(&gun(21000, 16000, TRIGGER)));
         assert_eq!(writes(&w), [(0x1018, pack_aim(x, y)), (0x101C, 0b001)]);
+    }
+
+    #[test]
+    fn controller_still_gun_starts_calibration_on_ticks() {
+        // The dock sends a report only when it changes: a gun held still
+        // with C1 + C2 gives one report, then the handheld's tick feeds the
+        // same report again. Calibration starts once 2 s have passed.
+        let mut c = Controller::new();
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
+        let report = gun(0, 0, C1C2 | button::OFF_SCREEN);
+        let mut t = 0;
+        let mut started = None;
+        while t <= 3000 {
+            if let (_, Some(e)) = c.update(t, Some(&report)) {
+                started = Some((t, e));
+                break;
+            }
+            t += MIN_AIM_INTERVAL_MS;
+        }
+        let (at, e) = started.expect("calibration did not start");
+        assert_eq!(e, CalibrationEvent::Started);
+        assert!((CALIBRATION_HOLD_MS..CALIBRATION_HOLD_MS + MIN_AIM_INTERVAL_MS).contains(&at));
+        // Off screen there: the corner is not taken.
+        let (_, e) = c.update(at + 100, Some(&gun(0, 0, TRIGGER | button::OFF_SCREEN)));
+        assert_eq!(e, Some(CalibrationEvent::OffScreen));
+    }
+
+    #[test]
+    fn controller_still_aim_reaches_the_core_on_ticks() {
+        // An aim moved within 8 ms of the last write is held back; the gun
+        // then stops (no more reports): the tick writes the last aim.
+        let mut c = Controller::new();
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
+        c.update(0, Some(&gun(0, 0, 0)));
+        assert!(c.update(3, Some(&gun(500, 0, 0))).0.is_empty());
+        assert_eq!(
+            writes(&c.update(8, Some(&gun(500, 0, 0))).0),
+            [(0x1018, pack_aim(33268, 32768)), (0x101C, 0b000)]
+        );
+    }
+
+    #[test]
+    fn controller_tells_a_gun_that_sees_no_screen() {
+        let mut c = Controller::new();
+        c.set_target(Some(TARGET_3DO), Calibration::default(), 0);
+        let off = gun(0, 0, button::OFF_SCREEN);
+        let on = gun(0, 0, 0);
+        // Short trips off screen (reloading): nothing.
+        for t in (0..NO_SCREEN_NOTICE_MS).step_by(8) {
+            c.update(t, Some(&off));
+            assert_eq!(c.take_notice(), None, "at {t}");
+        }
+        c.update(NO_SCREEN_NOTICE_MS, Some(&on));
+        assert_eq!(c.take_notice(), None);
+        // Off screen from here for the whole time: told once.
+        let t0 = NO_SCREEN_NOTICE_MS + 10;
+        c.update(t0, Some(&off));
+        c.update(t0 + NO_SCREEN_NOTICE_MS - 1, Some(&off));
+        assert_eq!(c.take_notice(), None);
+        c.update(t0 + NO_SCREEN_NOTICE_MS, Some(&off));
+        assert_eq!(c.take_notice(), Some(GunNotice::NoScreen));
+        c.update(t0 + 3 * NO_SCREEN_NOTICE_MS, Some(&off));
+        assert_eq!(c.take_notice(), None);
+        // Sees the screen: told once; later trips off screen: nothing.
+        let t1 = t0 + 4 * NO_SCREEN_NOTICE_MS;
+        c.update(t1, Some(&on));
+        assert_eq!(c.take_notice(), Some(GunNotice::ScreenFound));
+        c.update(t1 + 1, Some(&off));
+        c.update(t1 + 5 * NO_SCREEN_NOTICE_MS, Some(&off));
+        c.update(t1 + 6 * NO_SCREEN_NOTICE_MS, Some(&on));
+        assert_eq!(c.take_notice(), None);
+        // Gone and back: watched again.
+        c.update(t1 + 7 * NO_SCREEN_NOTICE_MS, None);
+        let t2 = t1 + 8 * NO_SCREEN_NOTICE_MS;
+        c.update(t2, Some(&off));
+        c.update(t2 + NO_SCREEN_NOTICE_MS, Some(&off));
+        assert_eq!(c.take_notice(), Some(GunNotice::NoScreen));
     }
 }
