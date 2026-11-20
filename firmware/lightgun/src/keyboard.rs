@@ -114,13 +114,14 @@ pub struct Target {
     pub event: u32,
 }
 
-/// The Minimig core (apolkosnik/Minimig_GameBub, `rtl/gamebub/gb_host.sv`).
+/// The Minimig core (apolkosnik/Minimig_GameBub, `rtl/gamebub/gb_host.sv`)
+/// and its build variants (`crate::is_minimig`).
 pub const TARGET_MINIMIG: Target = Target { event: 0x0000_1038 };
 
 /// The keyboard register of a core, by its ID (core.json), if it takes one.
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
-        crate::CORE_MINIMIG => Some(TARGET_MINIMIG),
+        id if crate::is_minimig(id) => Some(TARGET_MINIMIG),
         _ => None,
     }
 }
@@ -269,6 +270,19 @@ mod tests {
         assert_eq!(target_for_core("apolkosnik.Minimig"), Some(Target { event: 0x1038 }));
         assert_eq!(target_for_core("apolkosnik.3DO"), None);
         assert_eq!(target_for_core(""), None);
+    }
+
+    #[test]
+    fn a_variant_of_the_minimig_core_takes_the_keyboard() {
+        // the 68040 build (variants/ap68040 there): the same register
+        assert_eq!(target_for_core("apolkosnik.Minimig040"), Some(TARGET_MINIMIG));
+        assert_eq!(target_for_core("apolkosnik.Minimig.040"), None);
+        assert_eq!(target_for_core("apolkosnik.minimig040"), None);
+        let mut k = Keyboard::new();
+        k.set_target(target_for_core("apolkosnik.Minimig040"));
+        assert!(k.enabled());
+        assert_eq!(events(&k.update(&set(&[keys(0x02, &[0x04])]))), [(0x1038, 0x104), (0x1038, 0x1E1)]);
+        assert_eq!(events(&k.update(&set(&[keys(0, &[])]))), [(0x1038, 0x004), (0x1038, 0x0E1)]);
     }
 
     #[test]

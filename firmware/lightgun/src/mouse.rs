@@ -251,7 +251,8 @@ pub const TARGET_3DO: Target = Target {
     standalone: false,
 };
 
-/// The Minimig core (apolkosnik/Minimig_GameBub, `rtl/gamebub/gb_host.sv`):
+/// The Minimig core (apolkosnik/Minimig_GameBub, `rtl/gamebub/gb_host.sv`)
+/// and its build variants (`crate::is_minimig`):
 /// the Amiga's mouse in port 1, from a dock mouse only (the core itself
 /// makes the right stick and the handheld's buttons a mouse).
 pub const TARGET_MINIMIG: Target = Target {
@@ -274,7 +275,7 @@ pub const TARGET_3DO_MOUSE2: Target = Target {
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
         crate::CORE_3DO => Some(TARGET_3DO),
-        crate::CORE_MINIMIG => Some(TARGET_MINIMIG),
+        id if crate::is_minimig(id) => Some(TARGET_MINIMIG),
         _ => None,
     }
 }
@@ -1723,6 +1724,24 @@ mod tests {
         // a light gun on the dock does not stop it
         m.report(&moved(2, 2));
         assert_eq!(writes(&m.update(2, true, &physical(button::LEFT))), [(0x1030, pack_motion(2, 2))]);
+    }
+
+    #[test]
+    fn a_variant_of_the_minimig_core_takes_a_dock_mouse() {
+        // the 68040 build (variants/ap68040 there): the same registers
+        assert_eq!(target_for_core("apolkosnik.Minimig040"), Some(TARGET_MINIMIG));
+        assert_eq!(second_target_for_core("apolkosnik.Minimig040"), None);
+        assert_eq!(target_for_core("apolkosnik.Minimig.040"), None);
+        assert_eq!(target_for_core("apolkosnik.minimig040"), None);
+        let mut m = Mouse::new();
+        m.set_target(target_for_core("apolkosnik.Minimig040"), CONTROLLER_PAD);
+        assert!(m.enabled());
+        assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
+        m.report(&moved(-7, 4));
+        assert_eq!(
+            writes(&m.update(1, false, &physical(button::RIGHT))),
+            [(0x1030, pack_motion(-7, 4)), (0x1034, 2)]
+        );
     }
 
     #[test]
