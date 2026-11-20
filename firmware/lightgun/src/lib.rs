@@ -122,6 +122,17 @@ pub const TARGET_3DO: Target = Target {
 /// (`mouse`) and a keyboard (`keyboard`).
 pub const CORE_MINIMIG: &str = "apolkosnik.Minimig";
 
+/// Whether a core, by its ID (core.json), is the Minimig core or one of its
+/// build variants (`variants/` there: another CPU with the same `gb_host`
+/// registers). A variant's ID is the core's with letters or digits after
+/// it, like "apolkosnik.Minimig040".
+pub fn is_minimig(core_id: &str) -> bool {
+    match core_id.strip_prefix(CORE_MINIMIG) {
+        Some(variant) => variant.bytes().all(|b| b.is_ascii_alphanumeric()),
+        None => false,
+    }
+}
+
 /// The light gun registers of a core, by its ID (core.json), if it takes one.
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
@@ -645,6 +656,25 @@ mod tests {
         assert_eq!(target_for_core("Game-Bub.GBA"), None);
         assert_eq!(target_for_core("apolkosnik.3do"), None);
         assert_eq!(target_for_core(""), None);
+    }
+
+    #[test]
+    fn minimig_core_and_its_variants() {
+        assert!(is_minimig("apolkosnik.Minimig"));
+        assert!(is_minimig("apolkosnik.Minimig040"));
+        assert!(is_minimig("apolkosnik.MinimigAP68040"));
+        assert!(!is_minimig("apolkosnik.minimig"));
+        assert!(!is_minimig("apolkosnik.Minimi"));
+        assert!(!is_minimig("apolkosnik.Minimig.040"));
+        assert!(!is_minimig("apolkosnik.Minimig 040"));
+        assert!(!is_minimig("apolkosnik.Minimig_040"));
+        assert!(!is_minimig("other.Minimig040"));
+        assert!(!is_minimig("apolkosnik.3DO"));
+        assert!(!is_minimig("Game-Bub.GBA"));
+        assert!(!is_minimig(""));
+        // neither takes a light gun
+        assert_eq!(target_for_core("apolkosnik.Minimig"), None);
+        assert_eq!(target_for_core("apolkosnik.Minimig040"), None);
     }
 
     #[test]
