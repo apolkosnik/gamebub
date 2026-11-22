@@ -29,6 +29,9 @@
 //! The `keyboard` module turns a USB keyboard on the dock into key events
 //! for a core that takes one (the Minimig core).
 //!
+//! The `net` module carries Ethernet frames between an adapter on the dock
+//! and a core's network board (the Minimig core's A2065).
+//!
 //! Everything here is pure logic, without the firmware's dependencies, so it
 //! runs on the host: `cargo test` in this directory.
 
@@ -36,6 +39,7 @@
 
 pub mod keyboard;
 pub mod mouse;
+pub mod net;
 
 /// The dock's light gun buttons (bits of `GamepadData`'s buttons word).
 pub mod button {

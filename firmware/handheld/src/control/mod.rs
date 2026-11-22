@@ -209,6 +209,12 @@ pub fn handle_bulk_in(data: &[u8]) {
         REQUEST_GAMEPAD_CONNECT => (),
         REQUEST_GAMEPAD_DATA => (),
         REQUEST_GAMEPAD_DISCONNECT => (),
+        // Ethernet frames for the core's network board, and the dock's
+        // adapter coming and going
+        lightgun::net::REQUEST_NET | lightgun::net::REQUEST_NET_LINK => {
+            crate::net::on_packet(data);
+            return;
+        }
         _ => return,
     }
 

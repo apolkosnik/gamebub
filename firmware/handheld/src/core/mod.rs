@@ -30,6 +30,12 @@ mod file_selection;
 mod files;
 mod files_disc;
 mod files_on_demand;
+
+/// A test build's counters of the on-demand reads (the hard disks' sectors),
+/// as a line, and cleared.
+pub fn files_on_demand_stats_line() -> Option<String> {
+    files_on_demand::stats::take_line()
+}
 mod handler;
 pub mod info;
 pub mod settings;
@@ -685,6 +691,11 @@ impl CoreManager {
         ));
         ui::send(ui::Message::EnterGame);
         self.stage = Stage::Running;
+
+        // (a core with a network board: fitted before its machine starts)
+        if let Some(id) = self.core_info.as_ref().map(|core| core.id.clone()) {
+            crate::net::before_run(&id);
+        }
 
         // Start core.
         let _ = Device::lock().fpga.write_u32(fpga::REG_CTRL_VIBRATE, 1);

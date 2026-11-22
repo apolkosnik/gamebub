@@ -20,6 +20,7 @@ mod hwinfo;
 mod input;
 mod kvs;
 mod led;
+mod net;
 mod power;
 pub mod ui;
 mod util;
@@ -90,6 +91,7 @@ fn init() -> anyhow::Result<&'static mut UI> {
 
     // Setup workers.
     worker::start();
+    net::start();
     power::PowerManager::start(&mut device);
 
     // Initial programming FPGA

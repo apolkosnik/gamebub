@@ -339,6 +339,8 @@ impl InputManager {
     }
 
     pub fn remove_all_gamepads(&mut self) {
+        // (the handheld has left the dock: its Ethernet adapter went too)
+        crate::net::undocked();
         log::info!("Removing all gamepads");
         self.slots = [None; 4];
         self.gamepads.clear();
@@ -487,6 +489,8 @@ impl InputManager {
     /// from the KVS. The input tick (`ui::Message::MouseTick`) runs while
     /// the core takes the light gun, or the mouse and the setting selects it.
     pub fn set_core(&mut self, core_id: Option<&str>, controller: u32) {
+        // (the network board, if the core has one: its own module)
+        crate::net::set_core(core_id);
         let was_ticking = self.ticking();
         let target = core_id.and_then(lightgun::target_for_core);
         let calibration = target

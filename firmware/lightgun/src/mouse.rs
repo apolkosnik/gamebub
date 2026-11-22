@@ -242,6 +242,9 @@ pub struct Target {
     /// pad or handheld buttons (the core makes its own mouse of those), and
     /// a light gun on the dock changes nothing.
     pub standalone: bool,
+    /// The wheel's clicks since the write before, `pack_wheel` (None: the
+    /// core has no wheel).
+    pub wheel: Option<u32>,
 }
 
 /// The 3DO core (apolkosnik/3DO_GameBub, `rtl/gamebub/gb_host.sv`).
@@ -250,6 +253,7 @@ pub const TARGET_3DO: Target = Target {
     buttons: 0x0000_1034,
     connected: 0,
     standalone: false,
+    wheel: None,
 };
 
 /// The Minimig core (apolkosnik/Minimig_GameBub, `rtl/gamebub/gb_host.sv`)
@@ -261,6 +265,7 @@ pub const TARGET_MINIMIG: Target = Target {
     buttons: 0x0000_1034,
     connected: 0,
     standalone: true,
+    wheel: Some(0x0000_103C),
 };
 
 /// The 3DO core's second mouse, chained while a second dock mouse is
@@ -270,6 +275,7 @@ pub const TARGET_3DO_MOUSE2: Target = Target {
     buttons: 0x0000_103C,
     connected: 1 << 16,
     standalone: false,
+    wheel: None,
 };
 
 /// The mouse registers of a core, by its ID (core.json), if it takes one.
@@ -292,6 +298,19 @@ pub fn second_target_for_core(core_id: &str) -> Option<Target> {
 /// The motion register: `{dy[31:16], dx[15:0]}`, each signed.
 pub const fn pack_motion(dx: i16, dy: i16) -> u32 {
     ((dy as u16 as u32) << 16) | dx as u16 as u32
+}
+
+/// The wheel's clicks for the core: eight bits, signed, away from the user
+/// positive (as the dock gives them), at most 127 either way.
+pub const fn pack_wheel(clicks: i32) -> u32 {
+    let clicks = if clicks > 127 {
+        127
+    } else if clicks < -127 {
+        -127
+    } else {
+        clicks
+    };
+    (clicks as i8) as u8 as u32
 }
 
 pub const BUTTON_LEFT: u32 = 1 << 0;
@@ -494,6 +513,8 @@ pub struct Mouse {
     motion: Motion,
     /// The stick's.
     cursor: Cursor,
+    /// The physical mouse's wheel clicks since the previous write.
+    wheel: i32,
     sent_buttons: Option<u32>,
     last_motion_write: Option<u64>,
 }
@@ -511,6 +532,7 @@ impl Mouse {
             controller: CONTROLLER_PAD,
             motion: Motion::new(),
             cursor: Cursor::new(),
+            wheel: 0,
             sent_buttons: None,
             last_motion_write: None,
         }
@@ -551,6 +573,9 @@ impl Mouse {
     pub fn report(&mut self, report: &MouseReport) {
         if self.enabled() {
             self.motion.add(report.dx, report.dy);
+            if self.target.is_some_and(|target| target.wheel.is_some()) {
+                self.wheel = self.wheel.saturating_add(report.wheel as i32);
+            }
         }
     }
 
@@ -585,6 +610,7 @@ impl Mouse {
         if !self.enabled() || gun_connected {
             self.motion.reset();
             self.cursor.reset();
+            self.wheel = 0;
             self.last_motion_write = None;
             if self.sent_buttons.is_some_and(|buttons| buttons != 0) {
                 writes.push(target.buttons, 0);
@@ -619,6 +645,15 @@ impl Mouse {
                 writes.push(target.motion, pack_motion(dx, dy));
                 self.last_motion_write = Some(now_ms);
             }
+        }
+
+        // The wheel's clicks (a physical mouse's only), after the movement.
+        if !physical {
+            self.wheel = 0;
+        }
+        if let (Some(address), true) = (target.wheel, self.wheel != 0) {
+            writes.push(address, pack_wheel(self.wheel));
+            self.wheel = 0;
         }
 
         // (With the second mouse's connected bit while a dock mouse drives it.)
@@ -690,6 +725,7 @@ mod tests {
                 buttons: 0x1034,
                 connected: 0,
                 standalone: false,
+                wheel: None,
             })
         );
         assert_eq!(target_for_core("Game-Bub.GBA"), None);
@@ -1796,5 +1832,68 @@ mod tests {
         assert_eq!(writes(&m.update(0, false, &input)), [(0x1034, 0)]);
         assert_eq!(writes(&m.update(500, false, &input)), []);
         assert_eq!(writes(&m.update(1000, false, &input)), []);
+    }
+
+    #[test]
+    fn minimig_takes_the_wheel() {
+        assert_eq!(pack_wheel(0), 0);
+        assert_eq!(pack_wheel(3), 3);
+        assert_eq!(pack_wheel(-2), 0xFE);
+        assert_eq!(pack_wheel(500), 127);
+        assert_eq!(pack_wheel(-500), 0x81);
+
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_MINIMIG), CONTROLLER_PAD);
+        assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
+        // Clicks alone: one write, once.
+        m.report(&MouseReport {
+            wheel: 1,
+            ..dock_mouse(0)
+        });
+        assert_eq!(writes(&m.update(8, false, &physical(0))), [(0x103C, 1)]);
+        assert!(m.update(16, false, &physical(0)).is_empty());
+        // Two reports before an update add up; towards the user negative.
+        for _ in 0..2 {
+            m.report(&MouseReport {
+                wheel: -1,
+                ..dock_mouse(0)
+            });
+        }
+        assert_eq!(writes(&m.update(24, false, &physical(0))), [(0x103C, 0xFE)]);
+        // With movement and a button: the movement, the wheel, the buttons.
+        m.report(&MouseReport {
+            dx: 5,
+            dy: -3,
+            wheel: 2,
+            ..dock_mouse(button::LEFT)
+        });
+        assert_eq!(
+            writes(&m.update(32, false, &physical(button::LEFT))),
+            [(0x1030, pack_motion(5, -3)), (0x103C, 2), (0x1034, 0b001)]
+        );
+        // Clicks one way and back before an update: nothing.
+        m.report(&MouseReport {
+            wheel: 1,
+            ..dock_mouse(button::LEFT)
+        });
+        m.report(&MouseReport {
+            wheel: -1,
+            ..dock_mouse(button::LEFT)
+        });
+        assert!(m.update(40, false, &physical(button::LEFT)).is_empty());
+    }
+
+    #[test]
+    fn the_3do_core_has_no_wheel() {
+        let mut m = Mouse::new();
+        m.set_target(Some(TARGET_3DO), CONTROLLER_MOUSE);
+        assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
+        m.report(&MouseReport {
+            dx: 1,
+            wheel: 4,
+            ..dock_mouse(0)
+        });
+        assert_eq!(writes(&m.update(8, false, &physical(0))), [(0x1030, pack_motion(1, 0))]);
+        assert!(m.update(16, false, &physical(0)).is_empty());
     }
 }

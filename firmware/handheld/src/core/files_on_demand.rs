@@ -12,6 +12,58 @@ use crate::device::{
 
 use super::{command, CoreManager};
 
+/// Where the time of the on-demand reads goes (a test build's counters:
+/// `crate::net` shows them and writes them to the card when a Minimig core
+/// ends): the requests and their bytes, the microseconds in the card (seek
+/// and read), in the SPI writes to the core, and between one request's end
+/// and the next one's start when that is under 200 ms (the core taking the
+/// data and asking again, and the way here).
+pub mod stats {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    pub static READS: AtomicU32 = AtomicU32::new(0);
+    pub static BYTES: Mutex<u64> = Mutex::new(0);
+    pub static CARD_US: Mutex<u64> = Mutex::new(0);
+    pub static SPI_US: Mutex<u64> = Mutex::new(0);
+    pub static GAP_US: Mutex<u64> = Mutex::new(0);
+    pub static GAPS: AtomicU32 = AtomicU32::new(0);
+    pub static LAST_END: Mutex<Option<Instant>> = Mutex::new(None);
+
+    pub fn add(counter: &Mutex<u64>, since: Instant) {
+        *counter.lock().unwrap() += since.elapsed().as_micros() as u64;
+    }
+
+    /// The counters as a line, and all of them cleared; None without a read.
+    pub fn take_line() -> Option<String> {
+        let reads = READS.swap(0, Ordering::Relaxed) as u64;
+        let bytes = std::mem::take(&mut *BYTES.lock().unwrap());
+        let gaps = GAPS.swap(0, Ordering::Relaxed) as u64;
+        let card = std::mem::take(&mut *CARD_US.lock().unwrap());
+        let spi = std::mem::take(&mut *SPI_US.lock().unwrap());
+        let gap = std::mem::take(&mut *GAP_US.lock().unwrap());
+        *LAST_END.lock().unwrap() = None;
+        if reads == 0 {
+            return None;
+        }
+        Some(format!(
+            "Disk: {} reads, {} KB; per read: card {} us, SPI {} us, between reads {} us ({} of them)",
+            reads,
+            bytes / 1024,
+            card / reads,
+            spi / reads,
+            if gaps != 0 { gap / gaps } else { 0 },
+            gaps
+        ))
+    }
+}
+
+/// The bytes of one SPI write of an on-demand read: the lock on the device
+/// is given up between two, so that what else goes to the core (a dock
+/// mouse's movement) does not wait for a whole request.
+const SPI_PIECE: usize = 4 * 1024;
+
 pub struct OnDemandFile {
     pub id: u16,
     pub file: File,
@@ -168,6 +220,14 @@ impl CoreManager {
             }
         };
 
+        let started = std::time::Instant::now();
+        if let Some(end) = *stats::LAST_END.lock().unwrap() {
+            let gap = started.duration_since(end).as_micros() as u64;
+            if gap < 200_000 {
+                *stats::GAP_US.lock().unwrap() += gap;
+                stats::GAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if file.file.seek(SeekFrom::Start(offset)).is_err() {
             result[0] = command::FILE_STATUS_ERR_IO;
             return false;
@@ -180,7 +240,10 @@ impl CoreManager {
         let mut transferred: usize = 0;
         while transferred < length {
             let chunk = (length - transferred).min(scratch.len());
-            let n = match file.file.read(&mut scratch[..chunk]) {
+            let card = std::time::Instant::now();
+            let read = file.file.read(&mut scratch[..chunk]);
+            stats::add(&stats::CARD_US, card);
+            let n = match read {
                 Ok(0) => break, // Reached EOF naturally
                 Ok(n) => n,
                 Err(_) => {
@@ -190,18 +253,27 @@ impl CoreManager {
                 }
             };
 
-            Device::lock()
-                .fpga
-                .spi_write(
-                    spi_max_clock,
-                    spi_command,
-                    address + transferred as u32,
-                    &scratch[..n],
-                )
-                .unwrap();
+            let spi = std::time::Instant::now();
+            let mut done = 0;
+            for piece in scratch[..n].chunks(SPI_PIECE) {
+                Device::lock()
+                    .fpga
+                    .spi_write(
+                        spi_max_clock,
+                        spi_command,
+                        address + (transferred + done) as u32,
+                        piece,
+                    )
+                    .unwrap();
+                done += piece.len();
+            }
+            stats::add(&stats::SPI_US, spi);
             transferred += n;
         }
 
+        stats::READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *stats::BYTES.lock().unwrap() += transferred as u64;
+        *stats::LAST_END.lock().unwrap() = Some(std::time::Instant::now());
         result[1] = transferred as u32;
         true
     }
