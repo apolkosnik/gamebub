@@ -124,7 +124,10 @@ pub fn on_packet(data: &[u8]) {
                 }
             }
             if LINK.swap(up, Ordering::AcqRel) != up {
-                log::info!("Network: the dock has {} Ethernet adapter", if up { "an" } else { "no" });
+                log::info!(
+                    "Network: the dock has {} Ethernet adapter",
+                    if up { "an" } else { "no" }
+                );
             }
         }
         Some(proto::REQUEST_NET) => {
@@ -173,7 +176,10 @@ pub fn before_run(core_id: &str) {
     let mut device = Device::lock();
     let serial = proto::serial_from(crate::hwinfo::get_serial_number().0);
     let ok = device.fpga.write_u32(proto::SERIAL, serial).is_ok()
-        && device.fpga.write_u32(proto::STATUS, proto::status_link(fitted, link)).is_ok();
+        && device
+            .fpga
+            .write_u32(proto::STATUS, proto::status_link(fitted, link))
+            .is_ok();
     log::info!(
         "Network: before the core runs, the board is {} ({})",
         if fitted { "fitted" } else { "not fitted" },
@@ -241,12 +247,22 @@ fn show_report(state: &mut Shown) {
     } else if b(0) != 0 {
         format!("Dock network: adapter ready ({device})")
     } else if b(1) == 0 {
-        format!("Dock network: no adapter. USB devices seen: {}, last {device}", b(3))
+        format!(
+            "Dock network: no adapter. USB devices seen: {}, last {device}",
+            b(3)
+        )
     } else {
-        format!("Dock network: adapter at stage {}, fault {}. Devices: {}, last {device}", b(1), b(2), b(3))
+        format!(
+            "Dock network: adapter at stage {}, fault {}. Devices: {}, last {device}",
+            b(1),
+            b(2),
+            b(3)
+        )
     };
     log::info!("{text}");
-    crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(text)));
+    crate::ui::send(crate::ui::Message::Notification(
+        crate::ui::Notification::new_long(text),
+    ));
 }
 
 /// The counts of the core that has ended, and the dock's, as a notification.
@@ -269,7 +285,11 @@ fn show_counts() {
     );
     log::info!("{text}");
     // (the card is free again: the core has ended)
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/sdcard/net-stats.txt") {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/sdcard/net-stats.txt")
+    {
         use std::io::Write;
         let _ = writeln!(file, "{text}");
     }
@@ -280,7 +300,11 @@ fn show_counts() {
     // (a test build: where the time of the hard disks' reads went)
     if let Some(text) = crate::core::files_on_demand_stats_line() {
         log::info!("{text}");
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/sdcard/net-stats.txt") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/sdcard/net-stats.txt")
+        {
             use std::io::Write;
             let _ = writeln!(file, "{text}");
         }
@@ -292,7 +316,11 @@ fn show_counts() {
 }
 
 fn run() {
-    let mut shown = Shown { shown: REPORT_NONE, last: REPORT_NONE, since: Instant::now() };
+    let mut shown = Shown {
+        shown: REPORT_NONE,
+        last: REPORT_NONE,
+        since: Instant::now(),
+    };
     let mut refused = 0u32;
     loop {
         if SHOW_REPORTS {
@@ -316,9 +344,11 @@ fn run() {
         } else {
             refused += 1;
             if SHOW_REPORTS && refused == 50 {
-                crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(
-                    "Network: the core does not take the board's setting".to_string(),
-                )));
+                crate::ui::send(crate::ui::Message::Notification(
+                    crate::ui::Notification::new_long(
+                        "Network: the core does not take the board's setting".to_string(),
+                    ),
+                ));
             }
         }
         if !link {
@@ -337,7 +367,13 @@ fn run() {
 /// start: the station address, this handheld's own, first).
 /// False if the core did not take it.
 fn tell_core(adapter: bool, link: bool) -> bool {
-    let want = if link { 2 } else if adapter { 3 } else { 1 };
+    let want = if link {
+        2
+    } else if adapter {
+        3
+    } else {
+        1
+    };
     let told = TOLD.load(Ordering::Acquire);
     if told == want {
         return true;
@@ -345,25 +381,44 @@ fn tell_core(adapter: bool, link: bool) -> bool {
     let mut device = Device::lock();
     let serial = proto::serial_from(crate::hwinfo::get_serial_number().0);
     let ok = device.fpga.write_u32(proto::SERIAL, serial).is_ok()
-        && device.fpga.write_u32(proto::STATUS, proto::status_link(adapter, link)).is_ok();
+        && device
+            .fpga
+            .write_u32(proto::STATUS, proto::status_link(adapter, link))
+            .is_ok();
     if ok {
         TOLD.store(want, Ordering::Release);
-        log::info!("Network: the core's board is told the link is {}", if link { "up" } else { "down" });
+        log::info!(
+            "Network: the core's board is told the link is {}",
+            if link { "up" } else { "down" }
+        );
         // the cable taken out or put in while the core runs
         if (told == 2 && want == 3) || (told == 3 && want == 2) {
             drop(device);
-            crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(
-                if link { "Network connected" } else { "Network unplugged (adapter or cable)" }.to_string(),
-            )));
+            crate::ui::send(crate::ui::Message::Notification(
+                crate::ui::Notification::new_long(
+                    if link {
+                        "Network connected"
+                    } else {
+                        "Network unplugged (adapter or cable)"
+                    }
+                    .to_string(),
+                ),
+            ));
         } else if SHOW_REPORTS && adapter {
             // (read back: the core says whether the board is fitted)
             let status = device.fpga.read_u32(proto::STATUS).unwrap_or(0);
             drop(device);
-            crate::ui::send(crate::ui::Message::Notification(crate::ui::Notification::new_long(format!(
-                "Network: A2065 {} (status {:05X}). Reset the Amiga if it has booted",
-                if status & (1 << 17) != 0 { "fitted" } else { "NOT fitted" },
-                status & 0xF_FFFF
-            ))));
+            crate::ui::send(crate::ui::Message::Notification(
+                crate::ui::Notification::new_long(format!(
+                    "Network: A2065 {} (status {:05X}). Reset the Amiga if it has booted",
+                    if status & (1 << 17) != 0 {
+                        "fitted"
+                    } else {
+                        "NOT fitted"
+                    },
+                    status & 0xF_FFFF
+                )),
+            ));
         }
     }
     ok
@@ -379,7 +434,8 @@ fn bring() -> bool {
         }
         let head = inbox.head;
         let len = inbox.lens[head];
-        scratch[..proto::buffer_len(len)].copy_from_slice(&inbox.frames[head][..proto::buffer_len(len)]);
+        scratch[..proto::buffer_len(len)]
+            .copy_from_slice(&inbox.frames[head][..proto::buffer_len(len)]);
         inbox.head = (head + 1) % INBOX_FRAMES;
         inbox.count -= 1;
         len
@@ -394,7 +450,12 @@ fn bring() -> bool {
                 let command = SpiCommand::new(FpgaSpiWordSize::Bits32);
                 let _ = device
                     .fpga
-                    .spi_write(None, command, proto::RX_BUFFER, &scratch[..proto::buffer_len(len)])
+                    .spi_write(
+                        None,
+                        command,
+                        proto::RX_BUFFER,
+                        &scratch[..proto::buffer_len(len)],
+                    )
                     .and_then(|_| device.fpga.write_u32(proto::RX_COMMIT, len as u32));
                 RX_FRAMES.fetch_add(1, Ordering::Relaxed);
                 return true;
@@ -448,7 +509,8 @@ fn send() -> bool {
 /// a time, when the one before has gone).
 fn write_piece(packet: &[u8]) -> bool {
     for _ in 0..PIECE_TRIES {
-        let written = unsafe { sys::tud_vendor_n_write(0, packet.as_ptr().cast(), packet.len() as u32) };
+        let written =
+            unsafe { sys::tud_vendor_n_write(0, packet.as_ptr().cast(), packet.len() as u32) };
         if written as usize == packet.len() {
             unsafe { sys::tud_vendor_n_write_flush(0) };
             return true;

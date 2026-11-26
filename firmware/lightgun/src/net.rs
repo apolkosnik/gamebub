@@ -249,7 +249,9 @@ mod tests {
     use super::*;
 
     fn frame(len: usize, seed: u8) -> Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed)).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+            .collect()
     }
 
     fn carry(r: &mut Reassembler, f: &[u8]) -> Option<Vec<u8>> {
@@ -257,7 +259,11 @@ mod tests {
         let all: Vec<Piece> = pieces(f).collect();
         for (i, p) in all.iter().enumerate() {
             let got = r.push(p.as_slice()).map(|s| s.to_vec());
-            assert_eq!(got.is_some(), i + 1 == all.len(), "only the last piece gives the frame");
+            assert_eq!(
+                got.is_some(),
+                i + 1 == all.len(),
+                "only the last piece gives the frame"
+            );
             if got.is_some() {
                 out = got;
             }
@@ -279,7 +285,7 @@ mod tests {
     fn pieces_are_at_most_a_packet_and_numbered() {
         let f = frame(1518, 3);
         let all: Vec<Piece> = pieces(&f).collect();
-        assert_eq!(all.len(), 26);   // 25 of 60 bytes and one of 18
+        assert_eq!(all.len(), 26); // 25 of 60 bytes and one of 18
         for (i, p) in all.iter().enumerate() {
             assert!(p.len <= PACKET);
             assert_eq!(p.bytes[0], REQUEST_NET);
@@ -308,7 +314,7 @@ mod tests {
         let pa: Vec<Piece> = pieces(&a).collect();
         for (i, p) in pa.iter().enumerate() {
             if i == 2 {
-                continue;   // lost
+                continue; // lost
             }
             assert!(r.push(p.as_slice()).is_none());
         }
@@ -367,7 +373,7 @@ mod tests {
         let f = frame(MAX_FRAME, 0);
         let mut all: Vec<Piece> = pieces(&f).collect();
         let last = all.len() - 1;
-        all[last].bytes[1] = 0;   // it does not end
+        all[last].bytes[1] = 0; // it does not end
         for p in &all {
             assert!(r.push(p.as_slice()).is_none());
         }

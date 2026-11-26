@@ -1893,7 +1893,10 @@ mod tests {
             wheel: 4,
             ..dock_mouse(0)
         });
-        assert_eq!(writes(&m.update(8, false, &physical(0))), [(0x1030, pack_motion(1, 0))]);
+        assert_eq!(
+            writes(&m.update(8, false, &physical(0))),
+            [(0x1030, pack_motion(1, 0))]
+        );
         assert!(m.update(16, false, &physical(0)).is_empty());
     }
 }

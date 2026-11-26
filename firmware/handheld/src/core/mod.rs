@@ -693,7 +693,7 @@ impl CoreManager {
         self.stage = Stage::Running;
 
         // (a core with a network board: fitted before its machine starts)
-        if let Some(id) = self.core_info.as_ref().map(|core| core.id.clone()) {
+        if let Some(id) = self.core_info.as_ref().map(|core| core.id) {
             crate::net::before_run(&id);
         }
 
