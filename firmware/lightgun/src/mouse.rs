@@ -282,7 +282,7 @@ pub const TARGET_3DO_MOUSE2: Target = Target {
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
         crate::CORE_3DO => Some(TARGET_3DO),
-        id if crate::is_minimig(id) => Some(TARGET_MINIMIG),
+        id if crate::has_minimig_input(id) => Some(TARGET_MINIMIG),
         _ => None,
     }
 }
@@ -1791,6 +1791,25 @@ mod tests {
         assert_eq!(
             writes(&m.update(2, true, &physical(button::LEFT))),
             [(0x1030, pack_motion(2, 2))]
+        );
+    }
+
+    #[test]
+    fn the_falcon_core_takes_a_dock_mouse() {
+        // apolkosnik/Falcon_GameBub's gb_host.sv: motion 0x1030, buttons 0x1034
+        for id in ["apolkosnik.Falcon", "apolkosnik.Falcon060"] {
+            assert_eq!(target_for_core(id), Some(TARGET_MINIMIG));
+            assert_eq!(second_target_for_core(id), None);
+        }
+        assert_eq!(target_for_core("apolkosnik.falcon"), None);
+        let mut m = Mouse::new();
+        m.set_target(target_for_core("apolkosnik.Falcon060"), CONTROLLER_PAD);
+        assert!(m.enabled());
+        assert_eq!(writes(&m.update(0, false, &physical(0))), [(0x1034, 0)]);
+        m.report(&moved(-7, 4));
+        assert_eq!(
+            writes(&m.update(1, false, &physical(button::LEFT))),
+            [(0x1030, pack_motion(-7, 4)), (0x1034, 1)]
         );
     }
 

@@ -121,7 +121,7 @@ pub const TARGET_MINIMIG: Target = Target { event: 0x0000_1038 };
 /// The keyboard register of a core, by its ID (core.json), if it takes one.
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
-        id if crate::is_minimig(id) => Some(TARGET_MINIMIG),
+        id if crate::has_minimig_input(id) => Some(TARGET_MINIMIG),
         _ => None,
     }
 }
@@ -275,6 +275,18 @@ mod tests {
         );
         assert_eq!(target_for_core("apolkosnik.3DO"), None);
         assert_eq!(target_for_core(""), None);
+    }
+
+    #[test]
+    fn the_falcon_core_takes_the_keyboard() {
+        // apolkosnik/Falcon_GameBub's gb_host.sv: key events at 0x1038
+        assert_eq!(target_for_core("apolkosnik.Falcon"), Some(TARGET_MINIMIG));
+        assert_eq!(
+            target_for_core("apolkosnik.Falcon060"),
+            Some(TARGET_MINIMIG)
+        );
+        assert_eq!(target_for_core("apolkosnik.falcon"), None);
+        assert_eq!(target_for_core("apolkosnik.3DO"), None);
     }
 
     #[test]

@@ -137,6 +137,25 @@ pub fn is_minimig(core_id: &str) -> bool {
     }
 }
 
+/// The Atari Falcon core (apolkosnik/Falcon_GameBub): a mouse and a keyboard
+/// at the Minimig core's registers (its `rtl/gamebub/gb_host.sv`).
+pub const CORE_FALCON: &str = "apolkosnik.Falcon";
+
+/// Whether a core is the Falcon core or one of its build variants (letters
+/// or digits after its ID, like "apolkosnik.Falcon060").
+pub fn is_falcon(core_id: &str) -> bool {
+    match core_id.strip_prefix(CORE_FALCON) {
+        Some(variant) => variant.bytes().all(|b| b.is_ascii_alphanumeric()),
+        None => false,
+    }
+}
+
+/// Whether a core takes the dock's mouse and keyboard at the Minimig core's
+/// registers: the Minimig core, the Falcon core, and their variants.
+pub fn has_minimig_input(core_id: &str) -> bool {
+    is_minimig(core_id) || is_falcon(core_id)
+}
+
 /// The light gun registers of a core, by its ID (core.json), if it takes one.
 pub fn target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
@@ -660,6 +679,29 @@ mod tests {
         assert_eq!(target_for_core("Game-Bub.GBA"), None);
         assert_eq!(target_for_core("apolkosnik.3do"), None);
         assert_eq!(target_for_core(""), None);
+    }
+
+    #[test]
+    fn falcon_core_and_its_variants() {
+        assert!(is_falcon("apolkosnik.Falcon"));
+        assert!(is_falcon("apolkosnik.Falcon060"));
+        assert!(!is_falcon("apolkosnik.falcon"));
+        assert!(!is_falcon("apolkosnik.Falco"));
+        assert!(!is_falcon("apolkosnik.Falcon.060"));
+        assert!(!is_falcon("apolkosnik.Falcon_060"));
+        assert!(!is_falcon("other.Falcon"));
+        assert!(!is_falcon("apolkosnik.Minimig"));
+        assert!(!is_falcon(""));
+        // the dock's mouse and keyboard at the Minimig core's registers
+        assert!(has_minimig_input("apolkosnik.Falcon"));
+        assert!(has_minimig_input("apolkosnik.Falcon060"));
+        assert!(has_minimig_input("apolkosnik.Minimig"));
+        assert!(has_minimig_input("apolkosnik.Minimig040"));
+        assert!(!has_minimig_input("apolkosnik.3DO"));
+        assert!(!has_minimig_input("Game-Bub.GBA"));
+        // no light gun
+        assert_eq!(target_for_core("apolkosnik.Falcon"), None);
+        assert_eq!(target_for_core("apolkosnik.Falcon060"), None);
     }
 
     #[test]
