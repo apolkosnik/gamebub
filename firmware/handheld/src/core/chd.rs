@@ -50,7 +50,9 @@ const _: () = assert!(DECODER_SPACE >= 2 * chd_codec::LZMA_PROBS + 2);
 /// Hunks between two checkpoints of the map decoder.
 const CHECKPOINT: u32 = 128;
 const MAX_TRACKS: usize = 99;
-const SYNC: [u8; 12] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+const SYNC: [u8; 12] = [
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+];
 
 const fn tag(s: &[u8; 4]) -> u32 {
     u32::from_be_bytes(*s)
@@ -206,7 +208,14 @@ impl MapBits {
     const WINDOW: usize = 1024;
 
     fn new(start: u64, len: u32) -> Self {
-        MapBits { start, len, pos: 0, window: vec![0; Self::WINDOW], window_at: 0, window_len: 0 }
+        MapBits {
+            start,
+            len,
+            pos: 0,
+            window: vec![0; Self::WINDOW],
+            window_at: 0,
+            window_len: 0,
+        }
     }
 
     fn byte(&mut self, file: &mut File, at: u32) -> Result<u8, String> {
@@ -232,7 +241,7 @@ impl MapBits {
         let first = (self.pos / 8) as u32;
         let skip = (self.pos % 8) as u32;
         let mut acc = 0u64;
-        let bytes = (skip + n + 7) / 8;
+        let bytes = (skip + n).div_ceil(8);
         for i in 0..bytes {
             acc = (acc << 8) | self.byte(file, first.saturating_add(i))? as u64;
         }
@@ -320,7 +329,12 @@ impl CompressedMap {
         file: &mut File,
     ) -> Result<MapEntry, String> {
         self.entries.pos = state.data_pos;
-        let mut entry = MapEntry { kind, length: 0, offset: state.offset, crc: 0 };
+        let mut entry = MapEntry {
+            kind,
+            length: 0,
+            offset: state.offset,
+            crc: 0,
+        };
         match kind {
             COMPRESSION_TYPE_0..=COMPRESSION_TYPE_3 => {
                 entry.length = self.entries.read(file, self.length_bits)?;
@@ -360,7 +374,7 @@ impl CompressedMap {
 enum Map {
     /// An uncompressed CHD: a 4-byte hunk number per hunk at this offset (0: all zeros).
     Raw(u64),
-    Compressed(CompressedMap),
+    Compressed(Box<CompressedMap>),
 }
 
 pub struct Chd {
@@ -399,14 +413,20 @@ fn codec_name(codec: u32) -> String {
     if codec == CODEC_NONE {
         return "none".into();
     }
-    codec.to_be_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect()
+    codec
+        .to_be_bytes()
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { '?' })
+        .collect()
 }
 
 impl Chd {
     pub fn open(path: &Path) -> Result<Self, String> {
         let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut header = [0u8; 124];
-        let n = file.read(&mut header).map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = file
+            .read(&mut header)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         if n < 16 || &header[..8] != b"MComprHD" {
             return Err(format!("{}: not a CHD file", path.display()));
         }
@@ -420,16 +440,27 @@ impl Chd {
         if n < header.len() || be32(&header[8..]) < 124 {
             return Err(format!("{}: CHD header too short", path.display()));
         }
-        let codecs = [be32(&header[16..]), be32(&header[20..]), be32(&header[24..]), be32(&header[28..])];
+        let codecs = [
+            be32(&header[16..]),
+            be32(&header[20..]),
+            be32(&header[24..]),
+            be32(&header[28..]),
+        ];
         let logical_bytes = be64(&header[32..]);
         let map_offset = be64(&header[40..]);
         let meta_offset = be64(&header[48..]);
         let hunk_bytes = be32(&header[56..]);
         let unit_bytes = be32(&header[60..]);
         if header[104..124].iter().any(|&b| b != 0) {
-            return Err(format!("{}: a CHD that needs a parent CHD (not supported)", path.display()));
+            return Err(format!(
+                "{}: a CHD that needs a parent CHD (not supported)",
+                path.display()
+            ));
         }
-        if unit_bytes != FRAME_SIZE as u32 || hunk_bytes == 0 || hunk_bytes % FRAME_SIZE as u32 != 0 {
+        if unit_bytes != FRAME_SIZE as u32
+            || hunk_bytes == 0
+            || !hunk_bytes.is_multiple_of(FRAME_SIZE as u32)
+        {
             return Err(format!(
                 "{}: not a CD image (unit {unit_bytes} bytes, hunk {hunk_bytes})",
                 path.display()
@@ -449,8 +480,20 @@ impl Chd {
                     path.display()
                 ));
             }
-            if !matches!(c, CODEC_NONE | CODEC_ZLIB | CODEC_LZMA | CODEC_CD_ZLIB | CODEC_CD_LZMA | CODEC_CD_FLAC) {
-                return Err(format!("{}: unsupported codec {}", path.display(), codec_name(c)));
+            if !matches!(
+                c,
+                CODEC_NONE
+                    | CODEC_ZLIB
+                    | CODEC_LZMA
+                    | CODEC_CD_ZLIB
+                    | CODEC_CD_LZMA
+                    | CODEC_CD_FLAC
+            ) {
+                return Err(format!(
+                    "{}: unsupported codec {}",
+                    path.display(),
+                    codec_name(c)
+                ));
             }
         }
         let hunk_count = logical_bytes.div_ceil(hunk_bytes as u64);
@@ -460,14 +503,15 @@ impl Chd {
         let hunk_count = hunk_count as u32;
         let frames_per_hunk = hunk_bytes as usize / FRAME_SIZE;
 
-        let tracks = Self::read_tracks(&mut file, meta_offset).map_err(|e| format!("{}: {e}", path.display()))?;
+        let tracks = Self::read_tracks(&mut file, meta_offset)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let map = if codecs[0] == CODEC_NONE {
             Map::Raw(map_offset)
         } else {
-            Map::Compressed(
+            Map::Compressed(Box::new(
                 Self::scan_map(&mut file, map_offset, hunk_count, hunk_bytes, unit_bytes)
                     .map_err(|e| format!("{}: {e}", path.display()))?,
-            )
+            ))
         };
         let chd = Chd {
             file,
@@ -481,15 +525,27 @@ impl Chd {
             subcode: vec![0; frames_per_hunk * SUBCODE_DATA],
             tracks,
         };
-        let frames: u64 = chd.tracks.iter().map(|t| (t.chd_frame + t.frames) as u64).max().unwrap_or(0);
+        let frames: u64 = chd
+            .tracks
+            .iter()
+            .map(|t| (t.chd_frame + t.frames) as u64)
+            .max()
+            .unwrap_or(0);
         if frames > hunk_count as u64 * frames_per_hunk as u64 {
-            return Err(format!("{}: the tracks need more frames than the CHD has", path.display()));
+            return Err(format!(
+                "{}: the tracks need more frames than the CHD has",
+                path.display()
+            ));
         }
         log::info!(
             "CHD: {} hunks of {} frames, codecs {}",
             hunk_count,
             frames_per_hunk,
-            codecs.iter().map(|&c| codec_name(c)).collect::<Vec<_>>().join(",")
+            codecs
+                .iter()
+                .map(|&c| codec_name(c))
+                .collect::<Vec<_>>()
+                .join(",")
         );
         Ok(chd)
     }
@@ -518,7 +574,8 @@ impl Chd {
                     return Err("track metadata too long".into());
                 }
                 let mut text = vec![0u8; length];
-                file.read_exact(&mut text).map_err(|e| format!("metadata: {e}"))?;
+                file.read_exact(&mut text)
+                    .map_err(|e| format!("metadata: {e}"))?;
                 let text = String::from_utf8_lossy(&text);
                 let track = Self::parse_track(text.trim_end_matches('\0'))?;
                 let slot = &mut found[track.number as usize - 1];
@@ -549,7 +606,10 @@ impl Chd {
                 .find_map(|f| f.strip_prefix(key).and_then(|v| v.strip_prefix(':')))
         };
         let number_of = |key: &str| -> Result<u32, String> {
-            field(key).unwrap_or("0").parse().map_err(|_| format!("bad track metadata: {text}"))
+            field(key)
+                .unwrap_or("0")
+                .parse()
+                .map_err(|_| format!("bad track metadata: {text}"))
         };
         let number = number_of("TRACK")?;
         if number == 0 || number as usize > MAX_TRACKS {
@@ -568,7 +628,7 @@ impl Chd {
         };
         let frames = number_of("FRAMES")?;
         let pregap = number_of("PREGAP")?;
-        let pregap_in_data = pregap > 0 && field("PGTYPE").map_or(false, |t| t.starts_with('V'));
+        let pregap_in_data = pregap > 0 && field("PGTYPE").is_some_and(|t| t.starts_with('V'));
         if frames == 0 || (pregap_in_data && pregap >= frames) {
             return Err(format!("bad track metadata: {text}"));
         }
@@ -599,7 +659,8 @@ impl Chd {
         let map_bytes = be32(&header);
         let first_offset = be48(&header[4..]);
         let map_crc = be16(&header[10..]) as u16;
-        let (length_bits, self_bits, parent_bits) = (header[12] as u32, header[13] as u32, header[14] as u32);
+        let (length_bits, self_bits, parent_bits) =
+            (header[12] as u32, header[13] as u32, header[14] as u32);
         if length_bits > 32 || self_bits > 32 || parent_bits > 32 {
             return Err("bad map header".into());
         }
@@ -617,7 +678,10 @@ impl Chd {
         };
 
         // The type stream first: the entries follow its end.
-        let mut state = MapState { type_pos: map.types.pos, ..Default::default() };
+        let mut state = MapState {
+            type_pos: map.types.pos,
+            ..Default::default()
+        };
         let types_start = state;
         for _ in 0..hunk_count {
             map.next_type(&mut state, file)?;
@@ -682,7 +746,14 @@ impl Chd {
                 let first = hunk - hunk % CHECKPOINT;
                 for h in first..=hunk {
                     let kind = map.next_type(&mut state, &mut self.file)?;
-                    let e = map.next_entry(kind, h, self.hunk_bytes, self.unit_bytes, &mut state, &mut self.file)?;
+                    let e = map.next_entry(
+                        kind,
+                        h,
+                        self.hunk_bytes,
+                        self.unit_bytes,
+                        &mut state,
+                        &mut self.file,
+                    )?;
                     if h == hunk {
                         return Ok(e);
                     }
@@ -705,9 +776,16 @@ impl Chd {
     pub fn work_sizes(&self) -> [usize; 3] {
         let uses = |codec: u32| self.codecs.contains(&codec);
         let hunk_bytes = self.hunk_bytes as usize;
-        let full = if uses(CODEC_ZLIB) || uses(CODEC_LZMA) { hunk_bytes } else { 0 };
-        let decoder =
-            if uses(CODEC_LZMA) || uses(CODEC_CD_LZMA) || uses(CODEC_CD_FLAC) { DECODER_SPACE } else { 0 };
+        let full = if uses(CODEC_ZLIB) || uses(CODEC_LZMA) {
+            hunk_bytes
+        } else {
+            0
+        };
+        let decoder = if uses(CODEC_LZMA) || uses(CODEC_CD_LZMA) || uses(CODEC_CD_FLAC) {
+            DECODER_SPACE
+        } else {
+            0
+        };
         [hunk_bytes, full, decoder]
     }
 
@@ -723,7 +801,10 @@ impl Chd {
         decoder: &mut [u8],
     ) -> Result<(), String> {
         let [need_compressed, need_full, need_decoder] = self.work_sizes();
-        if compressed.len() < need_compressed || full.len() < need_full || decoder.len() < need_decoder {
+        if compressed.len() < need_compressed
+            || full.len() < need_full
+            || decoder.len() < need_decoder
+        {
             return Err("work buffer too small".into());
         }
         let frames = self.frames() as u32;
@@ -734,7 +815,8 @@ impl Chd {
         }
         if self.cached != Some(hunk) {
             self.cached = None;
-            self.load_hunk(hunk, compressed, full, decoder).map_err(|e| format!("hunk {hunk}: {e}"))?;
+            self.load_hunk(hunk, compressed, full, decoder)
+                .map_err(|e| format!("hunk {hunk}: {e}"))?;
             self.cached = Some(hunk);
         }
         let at = (frame % frames) as usize * SECTOR_DATA;
@@ -742,7 +824,13 @@ impl Chd {
         Ok(())
     }
 
-    fn load_hunk(&mut self, hunk: u32, compressed: &mut [u8], full: &mut [u8], decoder: &mut [u8]) -> Result<(), String> {
+    fn load_hunk(
+        &mut self,
+        hunk: u32,
+        compressed: &mut [u8],
+        full: &mut [u8],
+        decoder: &mut [u8],
+    ) -> Result<(), String> {
         let hunk_bytes = self.hunk_bytes as usize;
         let mut e = self.entry(hunk)?;
         // A self reference repeats an earlier hunk (which is never one itself
@@ -775,7 +863,11 @@ impl Chd {
                 self.read_at(e.offset, &mut compressed[..len])?;
                 let codec = self.codecs[e.kind as usize];
                 // (the whole hunk exactly, as before; empty for the CD codecs)
-                let full_len = if full.len() >= hunk_bytes { hunk_bytes } else { full.len() };
+                let full_len = if full.len() >= hunk_bytes {
+                    hunk_bytes
+                } else {
+                    full.len()
+                };
                 self.decompress(codec, &compressed[..len], &mut full[..full_len], decoder)
                     .map_err(|err| format!("{}: {err}", codec_name(codec)))?;
             }
@@ -805,14 +897,22 @@ impl Chd {
     fn deinterleave(&mut self, full: &[u8]) {
         for f in 0..self.frames() {
             let frame = &full[f * FRAME_SIZE..(f + 1) * FRAME_SIZE];
-            self.cache[f * SECTOR_DATA..(f + 1) * SECTOR_DATA].copy_from_slice(&frame[..SECTOR_DATA]);
-            self.subcode[f * SUBCODE_DATA..(f + 1) * SUBCODE_DATA].copy_from_slice(&frame[SECTOR_DATA..]);
+            self.cache[f * SECTOR_DATA..(f + 1) * SECTOR_DATA]
+                .copy_from_slice(&frame[..SECTOR_DATA]);
+            self.subcode[f * SUBCODE_DATA..(f + 1) * SUBCODE_DATA]
+                .copy_from_slice(&frame[SECTOR_DATA..]);
         }
     }
 
     /// Decompress a hunk into the cache and the subcode; `full` is scratch
     /// space of one hunk, `decoder` of [`DECODER_SPACE`] bytes.
-    fn decompress(&mut self, codec: u32, src: &[u8], full: &mut [u8], decoder: &mut [u8]) -> Result<(), String> {
+    fn decompress(
+        &mut self,
+        codec: u32,
+        src: &[u8],
+        full: &mut [u8],
+        decoder: &mut [u8],
+    ) -> Result<(), String> {
         let frames = self.frames();
         match codec {
             CODEC_ZLIB => {
@@ -841,8 +941,11 @@ impl Chd {
                 if src.len() < header {
                     return Err("short hunk".into());
                 }
-                let base_len =
-                    if length_bytes == 2 { be16(&src[ecc_bytes..]) } else { be24(&src[ecc_bytes..]) } as usize;
+                let base_len = if length_bytes == 2 {
+                    be16(&src[ecc_bytes..])
+                } else {
+                    be24(&src[ecc_bytes..])
+                } as usize;
                 if header + base_len > src.len() {
                     return Err("bad base length".into());
                 }

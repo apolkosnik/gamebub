@@ -94,12 +94,10 @@ pub fn send(message: Message) {
         return;
     };
     let input = matches!(message, Message::GamepadInput(..));
-    if input {
-        if PENDING_INPUT.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_INPUT {
-            PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
-            DROPPED_INPUT.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+    if input && PENDING_INPUT.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_INPUT {
+        PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
+        DROPPED_INPUT.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     match sender.try_send(message) {
         Ok(()) => {}

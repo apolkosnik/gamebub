@@ -204,9 +204,10 @@ pub const CONTROLLER_TWO_MICE: u32 = 4;
 
 /// Whether a Controller setting puts the mouse on the control port.
 pub const fn takes_mouse(controller: u32) -> bool {
-    controller == CONTROLLER_MOUSE || controller == CONTROLLER_MOUSE_FIRST || controller == CONTROLLER_TWO_MICE
+    controller == CONTROLLER_MOUSE
+        || controller == CONTROLLER_MOUSE_FIRST
+        || controller == CONTROLLER_TWO_MICE
 }
-
 
 /// Which of the core's mice (0: the first, 1: the second) the dock mouse at
 /// `index` (among the dock's mice, in the order it connected them) drives:
@@ -621,7 +622,11 @@ impl Mouse {
         }
 
         // (With the second mouse's connected bit while a dock mouse drives it.)
-        let connected = if input.mouse.is_some() { target.connected } else { 0 };
+        let connected = if input.mouse.is_some() {
+            target.connected
+        } else {
+            0
+        };
         let buttons = input.buttons() | connected;
         if self.sent_buttons != Some(buttons) {
             writes.push(target.buttons, buttons);
@@ -704,7 +709,10 @@ mod tests {
         assert!(takes_mouse(CONTROLLER_MOUSE_FIRST));
         assert_eq!(CONTROLLER_TWO_MICE, 4);
         assert!(takes_mouse(CONTROLLER_TWO_MICE));
-        assert_eq!(second_target_for_core(crate::CORE_3DO), Some(TARGET_3DO_MOUSE2));
+        assert_eq!(
+            second_target_for_core(crate::CORE_3DO),
+            Some(TARGET_3DO_MOUSE2)
+        );
         assert_eq!(second_target_for_core("Game-Bub.GB"), None);
     }
 
@@ -712,9 +720,18 @@ mod tests {
     fn mice_each_their_own() {
         // As two mice chained on a console: the first dock mouse is the first
         // 3DO mouse, the second the second, a third none.
-        let a = MouseReport { buttons: button::MOUSE | 1, ..moved(0, 0) };
-        let b = MouseReport { buttons: button::MOUSE | 2, ..moved(0, 0) };
-        let c = MouseReport { buttons: button::MOUSE | 4, ..moved(0, 0) };
+        let a = MouseReport {
+            buttons: button::MOUSE | 1,
+            ..moved(0, 0)
+        };
+        let b = MouseReport {
+            buttons: button::MOUSE | 2,
+            ..moved(0, 0)
+        };
+        let c = MouseReport {
+            buttons: button::MOUSE | 4,
+            ..moved(0, 0)
+        };
         assert_eq!(mouse_for(0), Some(0));
         assert_eq!(mouse_for(1), Some(1));
         assert_eq!(mouse_for(2), None);
@@ -738,7 +755,10 @@ mod tests {
         // Connected bits: none for the first mouse, bit 16 for the second
         // while a dock mouse drives it.
         assert_eq!(writes(&m1.update(0, false, &physical(0))), [(0x1034, 0)]);
-        assert_eq!(writes(&m2.update(0, false, &physical(0))), [(0x103C, 1 << 16)]);
+        assert_eq!(
+            writes(&m2.update(0, false, &physical(0))),
+            [(0x103C, 1 << 16)]
+        );
         let reports = [moved(5, -3), moved(-7, 2)];
         for (index, report) in reports.iter().enumerate() {
             match mouse_for(index) {
@@ -747,13 +767,22 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        assert_eq!(writes(&m1.update(1, false, &physical(1))), [(0x1030, pack_motion(5, -3)), (0x1034, 1)]);
-        assert_eq!(writes(&m2.update(1, false, &physical(2))), [(0x1038, pack_motion(-7, 2)), (0x103C, (1 << 16) | 2)]);
+        assert_eq!(
+            writes(&m1.update(1, false, &physical(1))),
+            [(0x1030, pack_motion(5, -3)), (0x1034, 1)]
+        );
+        assert_eq!(
+            writes(&m2.update(1, false, &physical(2))),
+            [(0x1038, pack_motion(-7, 2)), (0x103C, (1 << 16) | 2)]
+        );
         assert!(m1.update(2, false, &physical(1)).is_empty());
         assert!(m2.update(2, false, &physical(2)).is_empty());
         // The second dock mouse unplugged: the bit goes (the core drops the
         // second mouse from the chain).
-        assert_eq!(writes(&m2.update(3, false, &MouseInput::default())), [(0x103C, 0)]);
+        assert_eq!(
+            writes(&m2.update(3, false, &MouseInput::default())),
+            [(0x103C, 0)]
+        );
     }
 
     #[test]
@@ -1723,13 +1752,19 @@ mod tests {
         );
         // a light gun on the dock does not stop it
         m.report(&moved(2, 2));
-        assert_eq!(writes(&m.update(2, true, &physical(button::LEFT))), [(0x1030, pack_motion(2, 2))]);
+        assert_eq!(
+            writes(&m.update(2, true, &physical(button::LEFT))),
+            [(0x1030, pack_motion(2, 2))]
+        );
     }
 
     #[test]
     fn a_variant_of_the_minimig_core_takes_a_dock_mouse() {
         // the 68040 build (variants/ap68040 there): the same registers
-        assert_eq!(target_for_core("apolkosnik.Minimig040"), Some(TARGET_MINIMIG));
+        assert_eq!(
+            target_for_core("apolkosnik.Minimig040"),
+            Some(TARGET_MINIMIG)
+        );
         assert_eq!(second_target_for_core("apolkosnik.Minimig040"), None);
         assert_eq!(target_for_core("apolkosnik.Minimig.040"), None);
         assert_eq!(target_for_core("apolkosnik.minimig040"), None);

@@ -159,7 +159,7 @@ impl InputState {
     /// in the axes), nor a light gun the running
     /// core takes as one (`gun_active`).
     fn is_pad(&self, gun_active: bool) -> bool {
-        !self.is_mouse() && !self.is_keyboard() && !(self.is_light_gun() && gun_active)
+        !(self.is_mouse() || self.is_keyboard() || (self.is_light_gun() && gun_active))
     }
 
     fn merge_gamepads(&mut self, gamepads: &[Gamepad], gun_active: bool) {
@@ -526,7 +526,11 @@ impl InputManager {
         if self.keyboard.enabled() != had_keyboard {
             log::info!(
                 "Keyboard: {}",
-                if self.keyboard.enabled() { "the dock's keyboards" } else { "off" }
+                if self.keyboard.enabled() {
+                    "the dock's keyboards"
+                } else {
+                    "off"
+                }
             );
         }
         // The gun stops (or starts) being a gamepad, and the core's

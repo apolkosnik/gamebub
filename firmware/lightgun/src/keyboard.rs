@@ -218,7 +218,9 @@ impl Keyboard {
                 if events.is_full() {
                     return events;
                 }
-                if self.held.contains(usage) != down.contains(usage) && down.contains(usage) == pressed {
+                if self.held.contains(usage) != down.contains(usage)
+                    && down.contains(usage) == pressed
+                {
                     events.push(target.event, pack_event(usage, pressed));
                     if pressed {
                         self.held.insert(usage);
@@ -267,7 +269,10 @@ mod tests {
 
     #[test]
     fn targets() {
-        assert_eq!(target_for_core("apolkosnik.Minimig"), Some(Target { event: 0x1038 }));
+        assert_eq!(
+            target_for_core("apolkosnik.Minimig"),
+            Some(Target { event: 0x1038 })
+        );
         assert_eq!(target_for_core("apolkosnik.3DO"), None);
         assert_eq!(target_for_core(""), None);
     }
@@ -275,21 +280,31 @@ mod tests {
     #[test]
     fn a_variant_of_the_minimig_core_takes_the_keyboard() {
         // the 68040 build (variants/ap68040 there): the same register
-        assert_eq!(target_for_core("apolkosnik.Minimig040"), Some(TARGET_MINIMIG));
+        assert_eq!(
+            target_for_core("apolkosnik.Minimig040"),
+            Some(TARGET_MINIMIG)
+        );
         assert_eq!(target_for_core("apolkosnik.Minimig.040"), None);
         assert_eq!(target_for_core("apolkosnik.minimig040"), None);
         let mut k = Keyboard::new();
         k.set_target(target_for_core("apolkosnik.Minimig040"));
         assert!(k.enabled());
-        assert_eq!(events(&k.update(&set(&[keys(0x02, &[0x04])]))), [(0x1038, 0x104), (0x1038, 0x1E1)]);
-        assert_eq!(events(&k.update(&set(&[keys(0, &[])]))), [(0x1038, 0x004), (0x1038, 0x0E1)]);
+        assert_eq!(
+            events(&k.update(&set(&[keys(0x02, &[0x04])]))),
+            [(0x1038, 0x104), (0x1038, 0x1E1)]
+        );
+        assert_eq!(
+            events(&k.update(&set(&[keys(0, &[])]))),
+            [(0x1038, 0x004), (0x1038, 0x0E1)]
+        );
     }
 
     #[test]
     fn report_from_dock_words() {
         assert!(KeyboardReport::is_keyboard(button::KEYBOARD | 2));
         assert!(!KeyboardReport::is_keyboard(1 << 30));
-        let r = KeyboardReport::from_dock(button::KEYBOARD | 0x22, 0x0504, 0x0706, 0x0908u16 as i16);
+        let r =
+            KeyboardReport::from_dock(button::KEYBOARD | 0x22, 0x0504, 0x0706, 0x0908u16 as i16);
         assert_eq!(r, keys(0x22, &[4, 5, 6, 7, 8, 9]));
         // usages above 0x7F in the high byte of an axis
         let r = KeyboardReport::from_dock(button::KEYBOARD, 0xE400u16 as i16, 0, 0);
@@ -308,7 +323,10 @@ mod tests {
     #[test]
     fn press_and_release() {
         let mut k = minimig();
-        assert_eq!(events(&k.update(&set(&[keys(0, &[0x04])]))), [(0x1038, 0x104)]);
+        assert_eq!(
+            events(&k.update(&set(&[keys(0, &[0x04])]))),
+            [(0x1038, 0x104)]
+        );
         assert_eq!(events(&k.update(&set(&[keys(0, &[0x04])]))), []);
         assert_eq!(events(&k.update(&set(&[keys(0, &[])]))), [(0x1038, 0x004)]);
     }
@@ -329,10 +347,16 @@ mod tests {
         let mut k = minimig();
         let a = keys(0, &[0x04]);
         let b = keys(0, &[0x04, 0x05]);
-        assert_eq!(events(&k.update(&set(&[a, b]))), [(0x1038, 0x104), (0x1038, 0x105)]);
+        assert_eq!(
+            events(&k.update(&set(&[a, b]))),
+            [(0x1038, 0x104), (0x1038, 0x105)]
+        );
         // one lets A go, the other still holds it
         assert_eq!(events(&k.update(&set(&[keys(0, &[]), b]))), []);
-        assert_eq!(events(&k.update(&set(&[keys(0, &[])]))), [(0x1038, 0x004), (0x1038, 0x005)]);
+        assert_eq!(
+            events(&k.update(&set(&[keys(0, &[])]))),
+            [(0x1038, 0x004), (0x1038, 0x005)]
+        );
     }
 
     #[test]
@@ -365,7 +389,10 @@ mod tests {
         k.update(&set(&[keys(0, &[0x04])]));
         k.set_target(Some(Target { event: 0x2000 }));
         assert_eq!(events(&k.update(&set(&[keys(0, &[])]))), []);
-        assert_eq!(events(&k.update(&set(&[keys(0, &[0x04])]))), [(0x2000, 0x104)]);
+        assert_eq!(
+            events(&k.update(&set(&[keys(0, &[0x04])]))),
+            [(0x2000, 0x104)]
+        );
     }
 
     #[test]
@@ -380,7 +407,10 @@ mod tests {
         assert!(k.pending(&s));
         let second = k.update(&s);
         assert_eq!(second.as_slice().len(), 20 - MAX_EVENTS);
-        assert_eq!(second.as_slice()[0], (0x1038, 0x100 | (4 + MAX_EVENTS as u32)));
+        assert_eq!(
+            second.as_slice()[0],
+            (0x1038, 0x100 | (4 + MAX_EVENTS as u32))
+        );
         assert!(!k.pending(&s));
     }
 }

@@ -43,7 +43,9 @@ pub const SECTOR_SIZE: usize = 2352;
 /// The user data of a MODE1 sector: what a 2048-byte-sector image holds.
 const COOKED_SIZE: usize = 2048;
 /// The sync pattern that starts every raw data sector.
-const SYNC: [u8; 12] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+const SYNC: [u8; 12] = [
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+];
 /// The absolute LBA of the first sector of the first file.
 const FIRST_LBA: u32 = 150;
 const MAX_TRACKS: usize = 99;
@@ -138,7 +140,14 @@ static EDC: [u32; 256] = edc_table();
 
 /// P (86, 24, 2, 86) or Q (52, 43, 86, 88) parity of a sector from its
 /// header on (`src`), into `out` (twice `major_count` bytes).
-fn ecc_block(src: &[u8], major_count: usize, minor_count: usize, major_mult: usize, minor_inc: usize, out: &mut [u8]) {
+fn ecc_block(
+    src: &[u8],
+    major_count: usize,
+    minor_count: usize,
+    major_mult: usize,
+    minor_inc: usize,
+    out: &mut [u8],
+) {
     let size = major_count * minor_count;
     for major in 0..major_count {
         let mut index = (major >> 1) * major_mult + (major & 1);
@@ -167,9 +176,9 @@ fn mode1_frame(lba: u32, sector: &mut [u8; SECTOR_SIZE]) {
     let msf = msf_bcd(lba);
     sector[..12].copy_from_slice(&SYNC);
     sector[12..16].copy_from_slice(&[(msf >> 16) as u8, (msf >> 8) as u8, msf as u8, 1]);
-    let edc = sector[..2064]
-        .iter()
-        .fold(0u32, |e, &b| (e >> 8) ^ EDC[((e ^ b as u32) & 0xff) as usize]);
+    let edc = sector[..2064].iter().fold(0u32, |e, &b| {
+        (e >> 8) ^ EDC[((e ^ b as u32) & 0xff) as usize]
+    });
     sector[2064..2068].copy_from_slice(&edc.to_le_bytes());
     sector[2068..2076].fill(0);
     ecc_generate(sector);
@@ -252,7 +261,10 @@ impl DiscImage {
     /// `.bin` of raw sectors, or any other (an `.iso`) of raw sectors if it
     /// starts with the sync pattern and of 2048-byte sectors otherwise.
     pub fn open(path: &Path) -> Result<Self, String> {
-        let extension_is = |ext: &str| path.extension().map_or(false, |e| e.eq_ignore_ascii_case(ext));
+        let extension_is = |ext: &str| {
+            path.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+        };
         if extension_is("cue") {
             Self::open_cue(path)
         } else if extension_is("chd") {
@@ -280,7 +292,10 @@ impl DiscImage {
                 file_sector: 0,
             };
             Ok(DiscImage {
-                files: vec![ImageFile { path: path.to_path_buf(), cooked }],
+                files: vec![ImageFile {
+                    path: path.to_path_buf(),
+                    cooked,
+                }],
                 chd: None,
                 work: Default::default(),
                 first: None,
@@ -307,8 +322,12 @@ impl DiscImage {
 
     /// The number of sectors in a file of `size` bytes.
     fn sector_count(path: &Path, size: u64, cooked: bool) -> Result<u32, String> {
-        let (sector_size, kind) = if cooked { (COOKED_SIZE, "2048-byte-sector") } else { (SECTOR_SIZE, "raw") };
-        if size == 0 || size % sector_size as u64 != 0 {
+        let (sector_size, kind) = if cooked {
+            (COOKED_SIZE, "2048-byte-sector")
+        } else {
+            (SECTOR_SIZE, "raw")
+        };
+        if size == 0 || !size.is_multiple_of(sector_size as u64) {
             return Err(format!(
                 "{}: not a {kind} image ({size} bytes, not a multiple of {sector_size})",
                 path.display()
@@ -369,7 +388,10 @@ impl DiscImage {
                     }
                     file_size = Self::size(&file_path)?;
                     file_sectors = None;
-                    files.push(ImageFile { path: file_path, cooked: false });
+                    files.push(ImageFile {
+                        path: file_path,
+                        cooked: false,
+                    });
                 }
                 "TRACK" => {
                     finish_track(pending.take(), &files, &mut tracks, file_base, &mut shift)?;
@@ -409,7 +431,13 @@ impl DiscImage {
                     if tracks.len() >= MAX_TRACKS {
                         return Err("too many tracks".to_string());
                     }
-                    pending = Some(Pending { number, audio, pregap: 0, index0: None, index1: None });
+                    pending = Some(Pending {
+                        number,
+                        audio,
+                        pregap: 0,
+                        index0: None,
+                        index1: None,
+                    });
                 }
                 "INDEX" => {
                     let p = pending
@@ -418,7 +446,8 @@ impl DiscImage {
                     let (index, time) = rest
                         .split_once(char::is_whitespace)
                         .ok_or_else(|| format!("bad INDEX line: {line}"))?;
-                    let sector = parse_msf(time).ok_or_else(|| format!("bad INDEX line: {line}"))?;
+                    let sector =
+                        parse_msf(time).ok_or_else(|| format!("bad INDEX line: {line}"))?;
                     match index.parse::<u32>() {
                         Ok(0) => p.index0 = Some(sector),
                         Ok(1) => p.index1 = Some(sector),
@@ -440,14 +469,26 @@ impl DiscImage {
         if tracks.is_empty() {
             return Err("no tracks".to_string());
         }
-        let lead_out = file_base + shift + sectors_of(files.last().unwrap(), file_size, file_sectors)?;
+        let lead_out =
+            file_base + shift + sectors_of(files.last().unwrap(), file_size, file_sectors)?;
         let last = tracks.last_mut().unwrap();
         if last.start >= lead_out {
-            return Err(format!("track {} is beyond the end of its file", last.number));
+            return Err(format!(
+                "track {} is beyond the end of its file",
+                last.number
+            ));
         }
         last.end = lead_out - 1;
 
-        Ok(DiscImage { files, chd: None, work: Default::default(), first: None, other: None, tracks, lead_out })
+        Ok(DiscImage {
+            files,
+            chd: None,
+            work: Default::default(),
+            first: None,
+            other: None,
+            tracks,
+            lead_out,
+        })
     }
 
     /// Open a CHD. As in MAME (`cdrom_file`), a track's pregap is either in
@@ -465,7 +506,10 @@ impl DiscImage {
             let data_start = if t.pregap_in_data { start } else { index1 };
             let data_end = data_start + t.frames - 1;
             let end = data_end + t.postgap;
-            files.push(ImageFile { path: path.to_path_buf(), cooked: t.cooked });
+            files.push(ImageFile {
+                path: path.to_path_buf(),
+                cooked: t.cooked,
+            });
             tracks.push(Track {
                 number: t.number,
                 audio: t.audio,
@@ -501,7 +545,15 @@ impl DiscImage {
             })?;
             work[i].resize(words, 0);
         }
-        Ok(DiscImage { files, chd: Some(chd), work, first: None, other: None, tracks, lead_out: lba })
+        Ok(DiscImage {
+            files,
+            chd: Some(chd),
+            work,
+            first: None,
+            other: None,
+            tracks,
+            lead_out: lba,
+        })
     }
 
     /// The CHD work space's pieces as allocated (bytes: the compressed
@@ -511,9 +563,16 @@ impl DiscImage {
     }
 
     pub fn log(&self) {
-        log::info!("Disc: {} tracks, lead-out at {}", self.tracks.len(), self.lead_out);
+        log::info!(
+            "Disc: {} tracks, lead-out at {}",
+            self.tracks.len(),
+            self.lead_out
+        );
         if self.chd.is_some() {
-            log::info!("  CHD work space in pieces of {:?} bytes", self.chd_work_sizes());
+            log::info!(
+                "  CHD work space in pieces of {:?} bytes",
+                self.chd_work_sizes()
+            );
         }
         for t in &self.tracks {
             log::info!(
@@ -524,7 +583,11 @@ impl DiscImage {
                 t.end,
                 t.index1,
                 t.file,
-                if self.files[t.file].cooked { "2048-byte sectors" } else { "raw" },
+                if self.files[t.file].cooked {
+                    "2048-byte sectors"
+                } else {
+                    "raw"
+                },
                 t.file_sector,
             );
         }
@@ -570,7 +633,9 @@ impl DiscImage {
     /// file, made up around its user data).
     pub fn read_sector(&mut self, lba: u32, buffer: &mut [u8; SECTOR_SIZE]) -> std::io::Result<()> {
         let track = self.tracks.iter().find(|t| lba >= t.start && lba <= t.end);
-        let Some(track) = track.filter(|t| lba >= t.data_start && t.data_end.map_or(true, |end| lba <= end)) else {
+        let Some(track) =
+            track.filter(|t| lba >= t.data_start && t.data_end.is_none_or(|end| lba <= end))
+        else {
             buffer.fill(0);
             return Ok(());
         };
@@ -579,10 +644,9 @@ impl DiscImage {
         let cooked = self.files[index].cooked;
         if let Some(chd) = &mut self.chd {
             // SAFETY: the words' own memory, as bytes, for this call.
-            let [compressed, full, decoder] = self
-                .work
-                .each_mut()
-                .map(|w| unsafe { core::slice::from_raw_parts_mut(w.as_mut_ptr() as *mut u8, w.len() * 4) });
+            let [compressed, full, decoder] = self.work.each_mut().map(|w| unsafe {
+                core::slice::from_raw_parts_mut(w.as_mut_ptr() as *mut u8, w.len() * 4)
+            });
             chd.read_frame_parts(sector as u32, buffer, compressed, full, decoder)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if cooked {
@@ -615,7 +679,10 @@ impl DiscImage {
             let start = Instant::now();
             let file = File::open(path)
                 .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-            log::info!("Disc: opened file {index} in {} ms", start.elapsed().as_millis());
+            log::info!(
+                "Disc: opened file {index} in {} ms",
+                start.elapsed().as_millis()
+            );
             Ok::<_, std::io::Error>(file)
         };
         if index == 0 {

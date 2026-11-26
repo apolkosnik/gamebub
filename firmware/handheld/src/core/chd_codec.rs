@@ -42,7 +42,11 @@ impl DeflateBits<'_> {
         }
         self.buf = if need == 32 { 0 } else { val >> need };
         self.cnt -= need;
-        Ok(if need == 32 { val } else { val & ((1 << need) - 1) })
+        Ok(if need == 32 {
+            val
+        } else {
+            val & ((1 << need) - 1)
+        })
     }
 }
 
@@ -55,7 +59,10 @@ struct Huffman {
 
 impl Huffman {
     const fn new() -> Self {
-        Huffman { count: [0; MAX_BITS + 1], symbol: [0; FIX_LCODES] }
+        Huffman {
+            count: [0; MAX_BITS + 1],
+            symbol: [0; FIX_LCODES],
+        }
     }
 
     /// Build the code from code lengths. Returns 0 for a complete code, a
@@ -129,16 +136,28 @@ impl DeflateBits<'_> {
 }
 
 const LBASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
-const LEXT: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const LEXT: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
 const DBASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-    8193, 12289, 16385, 24577,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
-const DEXT: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const DEXT: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
 
-fn codes(s: &mut DeflateBits, out: &mut [u8], pos: &mut usize, lencode: &Huffman, distcode: &Huffman) -> Result<()> {
+fn codes(
+    s: &mut DeflateBits,
+    out: &mut [u8],
+    pos: &mut usize,
+    lencode: &Huffman,
+    distcode: &Huffman,
+) -> Result<()> {
     loop {
         let symbol = s.decode(lencode)?;
         if symbol < 256 {
@@ -176,7 +195,12 @@ fn codes(s: &mut DeflateBits, out: &mut [u8], pos: &mut usize, lencode: &Huffman
 
 /// Raw deflate (no zlib header), filling `out` exactly.
 pub fn inflate(src: &[u8], out: &mut [u8]) -> Result<()> {
-    let mut s = DeflateBits { src, pos: 0, buf: 0, cnt: 0 };
+    let mut s = DeflateBits {
+        src,
+        pos: 0,
+        buf: 0,
+        cnt: 0,
+    };
     let mut pos = 0usize;
     let mut lencode = Huffman::new();
     let mut distcode = Huffman::new();
@@ -216,7 +240,9 @@ pub fn inflate(src: &[u8], out: &mut [u8]) -> Result<()> {
                 codes(&mut s, out, &mut pos, &lencode, &distcode)?;
             }
             2 => {
-                const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+                const ORDER: [usize; 19] = [
+                    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+                ];
                 let nlen = s.bits(5)? as usize + 257;
                 let ndist = s.bits(5)? as usize + 1;
                 let ncode = s.bits(4)? as usize + 4;
@@ -481,7 +507,10 @@ pub fn lzma(src: &[u8], out: &mut [u8], probs: &mut [u16]) -> Result<()> {
                 rep1 = rep0;
                 rep0 = dist;
             }
-            len = rc.len(&mut p[REP_LEN_DECODER..REP_LEN_DECODER + LEN_PROBS], pos_state)?;
+            len = rc.len(
+                &mut p[REP_LEN_DECODER..REP_LEN_DECODER + LEN_PROBS],
+                pos_state,
+            )?;
             state = if state < 7 { 8 } else { 11 };
         } else {
             rep3 = rep2;
@@ -491,7 +520,10 @@ pub fn lzma(src: &[u8], out: &mut [u8], probs: &mut [u16]) -> Result<()> {
             state = if state < 7 { 7 } else { 10 };
             // The distance.
             let len_state = len.min(3);
-            let slot = rc.tree(&mut p[POS_SLOT + (len_state << 6)..POS_SLOT + ((len_state + 1) << 6)], 6)?;
+            let slot = rc.tree(
+                &mut p[POS_SLOT + (len_state << 6)..POS_SLOT + ((len_state + 1) << 6)],
+                6,
+            )?;
             rep0 = if slot < 4 {
                 slot as usize
             } else {
@@ -626,7 +658,11 @@ fn crc8(data: &[u8]) -> u8 {
     for &b in data {
         crc ^= b;
         for _ in 0..8 {
-            crc = if crc & 0x80 != 0 { (crc << 1) ^ 0x07 } else { crc << 1 };
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
         }
     }
     crc
@@ -641,7 +677,7 @@ fn residual(s: &mut FlacBits, out: &mut [i32], order: usize) -> Result<()> {
     };
     let partition_order = s.read(4);
     let partitions = 1usize << partition_order;
-    if n % partitions != 0 || n / partitions < order {
+    if !n.is_multiple_of(partitions) || n / partitions < order {
         return Err("FLAC: bad partition order".into());
     }
     let mut i = order;
@@ -700,7 +736,9 @@ fn subframe(s: &mut FlacBits, out: &mut [i32], bps: u32) -> Result<()> {
                 out[i] = match order {
                     0 => r,
                     1 => r.wrapping_add(out[i - 1]),
-                    2 => r.wrapping_add(2i32.wrapping_mul(out[i - 1])).wrapping_sub(out[i - 2]),
+                    2 => r
+                        .wrapping_add(2i32.wrapping_mul(out[i - 1]))
+                        .wrapping_sub(out[i - 2]),
                     3 => r
                         .wrapping_add(3i32.wrapping_mul(out[i - 1].wrapping_sub(out[i - 2])))
                         .wrapping_add(out[i - 3]),
@@ -758,7 +796,12 @@ fn subframe(s: &mut FlacBits, out: &mut [i32], bps: u32) -> Result<()> {
 pub fn flac(src: &[u8], out: &mut [u8], samples: &mut [i32]) -> Result<usize> {
     let total = out.len() / 4;
     let mut done = 0usize;
-    let mut s = FlacBits { src, pos: 0, acc: 0, n: 0 };
+    let mut s = FlacBits {
+        src,
+        pos: 0,
+        acc: 0,
+        n: 0,
+    };
     while done < total {
         let start = s.consumed();
         if s.read(15) != 0x7ffc {

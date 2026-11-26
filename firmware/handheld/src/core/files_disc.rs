@@ -29,9 +29,11 @@ const _: () = assert!(disc::SECTOR_SIZE <= crate::bitstream::SCRATCH_SIZE);
 impl CoreManager {
     /// Whether the core's file `file_id` is an on-demand disc.
     pub(super) fn is_disc_file(&self, file_id: u16) -> bool {
-        self.core_info
-            .as_ref()
-            .is_some_and(|core| core.files.iter().any(|f| f.id == file_id && f.on_demand && f.disc))
+        self.core_info.as_ref().is_some_and(|core| {
+            core.files
+                .iter()
+                .any(|f| f.id == file_id && f.on_demand && f.disc)
+        })
     }
 
     /// Open the core's on-demand disc now, before the core runs, if it is a
@@ -47,7 +49,9 @@ impl CoreManager {
         };
         let chd = core.files.iter().enumerate().find_map(|(i, f)| {
             let path = self.selected_files.get(i)?.as_ref()?;
-            let is_chd = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("chd"));
+            let is_chd = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("chd"));
             (f.on_demand && f.disc && is_chd).then_some(f.id)
         });
         let Some(file_id) = chd else {
@@ -57,7 +61,9 @@ impl CoreManager {
         let (free, largest) = unsafe {
             (
                 esp_idf_svc::sys::esp_get_free_heap_size(),
-                esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT),
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                ),
             )
         };
         log::info!(
@@ -69,7 +75,11 @@ impl CoreManager {
 
     /// The disc in file `file_id`, opened on its first use.
     fn disc_image(&mut self, file_id: u16) -> Result<&mut disc::DiscImage, u32> {
-        if self.open_disc.as_ref().is_some_and(|(id, _)| *id == file_id) {
+        if self
+            .open_disc
+            .as_ref()
+            .is_some_and(|(id, _)| *id == file_id)
+        {
             return Ok(&mut self.open_disc.as_mut().unwrap().1);
         }
         let core = self.core_info.as_ref().unwrap();
@@ -115,7 +125,8 @@ impl CoreManager {
     pub(super) fn handle_disc_get_size(&mut self, file_id: u16, result: &mut [u32]) -> bool {
         match self.disc_image(file_id) {
             Ok(image) => {
-                let size = (image.lead_out() as u64).saturating_sub(FIRST_LBA) * disc::SECTOR_SIZE as u64;
+                let size =
+                    (image.lead_out() as u64).saturating_sub(FIRST_LBA) * disc::SECTOR_SIZE as u64;
                 result[0] = command::FILE_STATUS_OK;
                 result[1] = size as u32;
                 result[2] = (size >> 32) as u32;
@@ -154,8 +165,9 @@ impl CoreManager {
             result[0] = command::FILE_STATUS_ERR_IO;
             return false;
         };
-        let sector: &mut [u8; disc::SECTOR_SIZE] =
-            (&mut scratch.deref_mut()[..disc::SECTOR_SIZE]).try_into().unwrap();
+        let sector: &mut [u8; disc::SECTOR_SIZE] = (&mut scratch.deref_mut()[..disc::SECTOR_SIZE])
+            .try_into()
+            .unwrap();
         let command = SpiCommand::new(fpga::FpgaSpiWordSize::Bits32);
 
         let mut pos = offset;
@@ -211,7 +223,11 @@ impl CoreManager {
                 &toc,
             )
             .is_ok();
-        result[0] = if ok { command::FILE_STATUS_OK } else { command::FILE_STATUS_ERR_IO };
+        result[0] = if ok {
+            command::FILE_STATUS_OK
+        } else {
+            command::FILE_STATUS_ERR_IO
+        };
         ok
     }
 }
