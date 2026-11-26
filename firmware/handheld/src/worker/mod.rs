@@ -72,7 +72,9 @@ const QUEUE_LEN: usize = 64;
 
 /// Gamepad input messages waiting at most: more are dropped while the worker
 /// is busy (a save, a disc image being opened). A dock mouse sends hundreds a
-/// second; the next report of a pad has its whole state again.
+/// second; the next report of a pad has its whole state again. A keyboard's
+/// reports are never dropped (each key going down or up comes once, at a
+/// human rate), and take no part of this.
 const MAX_PENDING_INPUT: usize = 32;
 
 /// Gamepad input messages waiting in the queue.
@@ -86,14 +88,15 @@ static PENDING_FPGA_IRQ: AtomicU32 = AtomicU32::new(0);
 
 /// Send a message to the worker threads.
 ///
-/// Gamepad input is dropped while `MAX_PENDING_INPUT` wait. Anything else
-/// waits for room if the queue is full, which it should never be.
+/// Gamepad input (not a keyboard's) is dropped while `MAX_PENDING_INPUT`
+/// wait. Anything else waits for room if the queue is full, which it should
+/// never be.
 pub fn send(message: Message) {
     let Some(sender) = SENDER.get() else {
         log::error!("Dropping worker message {:?}", message);
         return;
     };
-    let input = matches!(message, Message::GamepadInput(..));
+    let input = matches!(&message, Message::GamepadInput(_, state) if !state.is_keyboard());
     if input && PENDING_INPUT.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_INPUT {
         PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
         DROPPED_INPUT.fetch_add(1, Ordering::Relaxed);
@@ -207,7 +210,9 @@ fn dispatch(message: Message) {
             InputManager::lock().remove_gamepad(id);
         }
         Message::GamepadInput(id, state) => {
-            PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
+            if !state.is_keyboard() {
+                PENDING_INPUT.fetch_sub(1, Ordering::AcqRel);
+            }
             let dropped = DROPPED_INPUT.swap(0, Ordering::Relaxed);
             if dropped != 0 {
                 log::warn!("Worker busy: {dropped} gamepad input messages dropped");
