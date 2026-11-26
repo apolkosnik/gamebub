@@ -214,15 +214,10 @@ impl CoreManager {
             }
         };
         let toc = image.toc();
-        let ok = Device::lock()
-            .fpga
-            .spi_write(
-                Some(MAX_SPI_READ_CLOCK),
-                SpiCommand::new(fpga::FpgaSpiWordSize::Bits32),
-                address,
-                &toc,
-            )
-            .is_ok();
+        let ok = write_toc(address, &toc);
+        if ok {
+            self.disc_toc = Some((file_id, address));
+        }
         result[0] = if ok {
             command::FILE_STATUS_OK
         } else {
@@ -230,4 +225,32 @@ impl CoreManager {
         };
         ok
     }
+
+    /// Write the table of contents of the disc now in file `file_id` (just
+    /// changed: the image is opened here) to `address`, where the core asked
+    /// for the old one's. Returns the table's size in bytes.
+    pub(super) fn send_disc_toc(&mut self, file_id: u16, address: u32) -> Result<u32, String> {
+        let toc = self
+            .disc_image(file_id)
+            .map_err(|_| "Cannot read the disc image".to_string())?
+            .toc();
+        log::info!("Disc change: new table of contents, {} bytes", toc.len());
+        if !write_toc(address, &toc) {
+            return Err("Cannot send the table of contents".to_string());
+        }
+        Ok(toc.len() as u32)
+    }
+}
+
+/// Write a table of contents (`disc::DiscImage::toc`) to the core's memory.
+fn write_toc(address: u32, toc: &[u8]) -> bool {
+    Device::lock()
+        .fpga
+        .spi_write(
+            Some(MAX_SPI_READ_CLOCK),
+            SpiCommand::new(fpga::FpgaSpiWordSize::Bits32),
+            address,
+            toc,
+        )
+        .is_ok()
 }

@@ -62,6 +62,11 @@ pub struct CoreManager {
     open_on_demand_file: Option<OnDemandFile>,
     /// The currently open on-demand disc (`disc` file), if any.
     open_disc: Option<(u16, disc::DiscImage)>,
+    /// The disc file whose table of contents the core asked for, and the
+    /// address it gave (`DISC_GET_TOC`): such a core reads the disc as the
+    /// raw image the firmware serves, and a disc change sends it the new
+    /// disc's table there (see `change_disc_inner`).
+    disc_toc: Option<(u16, u32)>,
     run_cartridge: bool,
     /// When the core last got focus, to put a duration on the statistics.
     focus_since: Option<Instant>,
@@ -93,6 +98,7 @@ impl CoreManager {
             selected_files: Vec::new(),
             open_on_demand_file: None,
             open_disc: None,
+            disc_toc: None,
             run_cartridge: false,
             focus_since: None,
             changing_disc: None,
@@ -245,6 +251,7 @@ impl CoreManager {
         self.open_on_demand_file = None;
         self.changing_disc = None;
         self.open_disc = None;
+        self.disc_toc = None;
 
         InputManager::lock().clear_core_input_caps();
         InputManager::lock().set_core(None, 0);
@@ -561,14 +568,25 @@ impl CoreManager {
         drop(scratch);
 
         // Tell the core; it reads the new disc once this returns (its
-        // requests wait for the core manager).
+        // requests wait for the core manager). A core that reads the disc as
+        // the raw image the firmware serves (it asked for its table of
+        // contents) gets the new disc's table, written where it asked for
+        // it, and its size (under 2048 bytes: a table, not data) at the end:
+        // the 3DO core takes that as a disc swap and reports the media
+        // change. Any other core gets a size of 1.
         self.run_core_command(
             &[command::FILE_WRITE_START, disc_id as u32],
             &mut [],
             SETUP_TIMEOUT,
         )?;
+        let size = match self.disc_toc {
+            Some((id, address)) if id == disc_id => self
+                .send_disc_toc(disc_id, address)
+                .map_err(|e| CoreError::FailedLoadFile(label, e))?,
+            _ => 1,
+        };
         self.run_core_command(
-            &[command::FILE_WRITE_END, disc_id as u32, 1, 0],
+            &[command::FILE_WRITE_END, disc_id as u32, size, 0],
             &mut [],
             NOTIFY_TIMEOUT,
         )?;
