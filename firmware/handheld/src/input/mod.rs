@@ -217,8 +217,9 @@ pub struct InputManager {
     /// selects the mouse.
     mouse: Mouse,
 
-    /// The core's second mouse, driven by the second dock mouse (the core
-    /// chains it while that mouse is connected).
+    /// The core's second mouse, driven by the second dock mouse (the 3DO
+    /// core chains it while that mouse is connected; the Minimig core has
+    /// it as the Amiga's mouse in port 2).
     mouse2: Mouse,
 
     /// The keyboard of the running core, if it takes one: the dock's

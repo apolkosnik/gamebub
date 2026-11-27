@@ -20,6 +20,10 @@
 //! `CONTROLLER_TWO_MICE` is an older value that the core takes as "mouse +
 //! pad".
 //!
+//! The Minimig core takes the second dock mouse too, as the Amiga's mouse
+//! in port 2 (`TARGET_MINIMIG_MOUSE2`), for games with a mouse for each of
+//! two players.
+//!
 //! What drives it is one of two things, in this order:
 //!
 //!  * A physical mouse on the dock. The dock reports one as an ordinary
@@ -268,6 +272,18 @@ pub const TARGET_MINIMIG: Target = Target {
     wheel: Some(0x0000_103C),
 };
 
+/// The Minimig core's second mouse: the Amiga's mouse in port 2, from the
+/// second dock mouse (the core's Ports setting can swap the two, or take
+/// them as one). Bit 16 of its buttons register is set while that mouse is
+/// connected. A core older than this mouse ignores the writes.
+pub const TARGET_MINIMIG_MOUSE2: Target = Target {
+    motion: 0x0000_1020,
+    buttons: 0x0000_1024,
+    connected: 1 << 16,
+    standalone: true,
+    wheel: Some(0x0000_1028),
+};
+
 /// The 3DO core's second mouse, chained while a second dock mouse is
 /// connected (bit 16 of its buttons register).
 pub const TARGET_3DO_MOUSE2: Target = Target {
@@ -291,6 +307,7 @@ pub fn target_for_core(core_id: &str) -> Option<Target> {
 pub fn second_target_for_core(core_id: &str) -> Option<Target> {
     match core_id {
         crate::CORE_3DO => Some(TARGET_3DO_MOUSE2),
+        id if crate::is_minimig(id) => Some(TARGET_MINIMIG_MOUSE2),
         _ => None,
     }
 }
@@ -1775,7 +1792,10 @@ mod tests {
     #[test]
     fn minimig_takes_a_dock_mouse_whatever_the_setting() {
         assert_eq!(target_for_core(crate::CORE_MINIMIG), Some(TARGET_MINIMIG));
-        assert_eq!(second_target_for_core(crate::CORE_MINIMIG), None);
+        assert_eq!(
+            second_target_for_core(crate::CORE_MINIMIG),
+            Some(TARGET_MINIMIG_MOUSE2)
+        );
         let mut m = Mouse::new();
         m.set_target(target_for_core("apolkosnik.Minimig"), CONTROLLER_PAD);
         assert!(m.enabled());
@@ -1820,7 +1840,11 @@ mod tests {
             target_for_core("apolkosnik.Minimig040"),
             Some(TARGET_MINIMIG)
         );
-        assert_eq!(second_target_for_core("apolkosnik.Minimig040"), None);
+        assert_eq!(
+            second_target_for_core("apolkosnik.Minimig040"),
+            Some(TARGET_MINIMIG_MOUSE2)
+        );
+        assert_eq!(second_target_for_core("apolkosnik.Minimig.040"), None);
         assert_eq!(target_for_core("apolkosnik.Minimig.040"), None);
         assert_eq!(target_for_core("apolkosnik.minimig040"), None);
         let mut m = Mouse::new();
@@ -1832,6 +1856,45 @@ mod tests {
             writes(&m.update(1, false, &physical(button::RIGHT))),
             [(0x1030, pack_motion(-7, 4)), (0x1034, 2)]
         );
+    }
+
+    #[test]
+    fn minimig_takes_a_second_dock_mouse_on_its_own_registers() {
+        let mut m2 = Mouse::new();
+        m2.set_target(second_target_for_core("apolkosnik.Minimig"), CONTROLLER_PAD);
+        assert!(m2.enabled());
+        // without a second mouse: its buttons released, once, and nothing
+        // from a stick or the pad's and the handheld's buttons
+        let no_mouse = MouseInput {
+            stick_x: FULL,
+            pad_r1: true,
+            handheld_l: true,
+            ..MouseInput::default()
+        };
+        assert_eq!(writes(&m2.update(0, false, &no_mouse)), [(0x1024, 0)]);
+        assert!(m2.update(500, false, &no_mouse).is_empty());
+        // the second mouse connected: the connected bit, then its movement,
+        // its wheel and its buttons, a light gun on the dock or not
+        assert_eq!(
+            writes(&m2.update(600, false, &physical(0))),
+            [(0x1024, 1 << 16)]
+        );
+        m2.report(&MouseReport {
+            dx: -4,
+            dy: 9,
+            wheel: -1,
+            ..dock_mouse(button::RIGHT)
+        });
+        assert_eq!(
+            writes(&m2.update(608, true, &physical(button::RIGHT))),
+            [
+                (0x1020, pack_motion(-4, 9)),
+                (0x1028, 0xFF),
+                (0x1024, (1 << 16) | 0b010)
+            ]
+        );
+        // gone again: released
+        assert_eq!(writes(&m2.update(700, false, &no_mouse)), [(0x1024, 0)]);
     }
 
     #[test]
